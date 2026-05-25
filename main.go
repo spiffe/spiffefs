@@ -463,7 +463,7 @@ func readHelper(content []byte, dest []byte, off int64) (fuse.ReadResult, syscal
 }
 
 func main() {
-	forceUnmount := flag.Bool("-umount", false, "Forcefully unmount the target directory if it is already mounted or stuck")
+	forceUnmount := flag.Bool("umount", false, "Forcefully unmount the target directory if it is already mounted or stuck")
 	flag.Parse()
 
 	args := flag.Args()
