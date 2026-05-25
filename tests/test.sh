@@ -26,6 +26,7 @@ teardown() {
     systemctl status test1 || true
     systemctl status test2 || true
     systemctl status test3 || true
+    systemctl status test4 || true
   fi
 }
 
@@ -132,3 +133,5 @@ sudo systemctl start --wait test2
 sudo systemctl status test2 || true
 sudo systemctl start --wait test3
 sudo systemctl status test3 || true
+sudo systemctl start --wait test4
+sudo systemctl status test4 || true

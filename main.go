@@ -223,12 +223,10 @@ func (id *IndexDir) Lookup(ctx context.Context, name string, out *fuse.EntryOut)
 	caller, ok := fuse.FromContext(ctx)
 	if !ok { return nil, syscall.EIO }
 
+	state, alive := verifyOrCreatePidState(caller.Pid)
+	if !alive { return nil, syscall.EACCES }
+
 	stateMutex.RLock()
-	state, exists := pidRegistry[caller.Pid]
-	if !exists {
-		stateMutex.RUnlock()
-		return nil, syscall.ENOENT
-	}
 	svid, found := state.SvidRegistry[id.indexName]
 	stateMutex.RUnlock()
 
@@ -268,12 +266,10 @@ func (id *IndexDir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	caller, ok := fuse.FromContext(ctx)
 	if !ok { return nil, syscall.EIO }
 
+	state, alive := verifyOrCreatePidState(caller.Pid)
+	if !alive { return nil, syscall.EACCES }
+
 	stateMutex.RLock()
-	state, exists := pidRegistry[caller.Pid]
-	if !exists {
-		stateMutex.RUnlock()
-		return nil, syscall.ENOENT
-	}
 	svid, found := state.SvidRegistry[id.indexName]
 	stateMutex.RUnlock()
 
@@ -325,7 +321,7 @@ func (t *TrustBundleFile) Open(ctx context.Context, flags uint32) (fs.FileHandle
 
 	snapshot := make([]byte, len(content))
 	copy(snapshot, content)
-	return &snapshotHandle{content: snapshot}, fuse.FOPEN_DIRECT_IO, 0
+	return &snapshotHandle{content: snapshot}, fuse.FOPEN_NONSEEKABLE, 0
 }
 
 func (t *TrustBundleFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
@@ -371,7 +367,7 @@ func (b *BundleFile) Open(ctx context.Context, flags uint32) (fs.FileHandle, uin
 
 	snapshot := make([]byte, len(svid.CredentialBundle))
 	copy(snapshot, svid.CredentialBundle)
-	return &snapshotHandle{content: snapshot}, fuse.FOPEN_DIRECT_IO, 0
+	return &snapshotHandle{content: snapshot}, fuse.FOPEN_NONSEEKABLE, 0
 }
 
 func (b *BundleFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
@@ -388,12 +384,11 @@ func (b *BundleFile) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.At
 	}
 	caller, ok := fuse.FromContext(ctx)
 	if !ok { return syscall.EACCES }
+
+	state, alive := verifyOrCreatePidState(caller.Pid)
+	if !alive { return syscall.EACCES }
+
 	stateMutex.RLock()
-	state, exists := pidRegistry[caller.Pid]
-	if !exists {
-		stateMutex.RUnlock()
-		return syscall.EIO
-	}
 	svid, found := state.SvidRegistry[b.indexName]
 	stateMutex.RUnlock()
 	if !found { return syscall.EIO }
@@ -425,7 +420,7 @@ func (h *HintFile) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 	content := []byte(svid.Hint + "\n")
 	snapshot := make([]byte, len(content))
 	copy(snapshot, content)
-	return &snapshotHandle{content: snapshot}, fuse.FOPEN_DIRECT_IO, 0
+	return &snapshotHandle{content: snapshot}, fuse.FOPEN_NONSEEKABLE, 0
 }
 
 func (h *HintFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
@@ -442,12 +437,11 @@ func (h *HintFile) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.Attr
 	}
 	caller, ok := fuse.FromContext(ctx)
 	if !ok { return syscall.EACCES }
+
+	state, alive := verifyOrCreatePidState(caller.Pid)
+	if !alive { return syscall.EACCES }
+
 	stateMutex.RLock()
-	state, exists := pidRegistry[caller.Pid]
-	if !exists {
-		stateMutex.RUnlock()
-		return syscall.EIO
-	}
 	svid, found := state.SvidRegistry[h.indexName]
 	stateMutex.RUnlock()
 	if !found || !svid.HasHint { return syscall.EIO }

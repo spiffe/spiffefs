@@ -1,0 +1,9 @@
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterStaticEntry
+metadata:
+  name: node1-test4
+spec:
+  parentID: spiffe://${SPIFFE_TRUST_DOMAIN}/agent/node1
+  spiffeID: spiffe://${SPIFFE_TRUST_DOMAIN}/test4
+  selectors:
+  - systemd:id:test4.service
