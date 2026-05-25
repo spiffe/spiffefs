@@ -5,7 +5,6 @@ version: 2
 
 before:
   hooks:
-    # You may remove this if you don't use go modules.
     - go mod tidy
 
 builds:
@@ -13,12 +12,14 @@ builds:
       - CGO_ENABLED=0
     goos:
       - linux
+    goarch:
+      - amd64
+      - arm64
     main: .
     binary: spiffefs
 
 archives:
   - format: tar.gz
-    # this name template makes the OS and Arch compatible with the results of `uname`.
     name_template: >-
       {{ .ProjectName }}_
       {{- title .Os }}_
@@ -26,7 +27,6 @@ archives:
       {{- else if eq .Arch "386" }}i386
       {{- else }}{{ .Arch }}{{ end }}
       {{- if .Arm }}v{{ .Arm }}{{ end }}
-    # use zip for windows archives
     format_overrides:
       - goos: windows
         format: zip
@@ -40,19 +40,29 @@ changelog:
 
 dockers:
   - image_templates:
-      - "ghcr.io/ghcr.io/spiffe/spiffefs:latest"
-      - "ghcr.io/ghcr.io/spiffe/spiffefs:{{ .Version }}"
+      - "ghcr.io/spiffe/spiffefs:{{ .Version }}-amd64"
+    use: buildx
+    goarch: amd64
     dockerfile: Dockerfile
-    
-    use: buildx 
-    
-    image_build_templates:
-      - "ghcr.io/ghcr.io/spiffe/spiffefs:latest --platform=linux/amd64"
-      - "ghcr.io/ghcr.io/spiffe/spiffefs:latest --platform=linux/arm64"
-      - "ghcr.io/ghcr.io/spiffe/spiffefs:{{ .Version }} --platform=linux/amd64"
-      - "ghcr.io/ghcr.io/spiffe/spiffefs:{{ .Version }} --platform=linux/arm64"
-      
     build_flag_templates:
-      - "--platform=linux/{{ .Arch }}"
+      - "--platform=linux/amd64"
       - "--label=org.opencontainers.image.title={{ .ProjectName }}"
 
+  - image_templates:
+      - "ghcr.io/spiffe/spiffefs:{{ .Version }}-arm64"
+    use: buildx
+    goarch: arm64
+    dockerfile: Dockerfile
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.title={{ .ProjectName }}"
+
+docker_manifests:
+  - name_template: "ghcr.io/spiffe/spiffefs:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/spiffe/spiffefs:{{ .Version }}-amd64"
+      - "ghcr.io/spiffe/spiffefs:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/spiffe/spiffefs:latest"
+    image_templates:
+      - "ghcr.io/spiffe/spiffefs:{{ .Version }}-amd64"
+      - "ghcr.io/spiffe/spiffefs:{{ .Version }}-arm64"
