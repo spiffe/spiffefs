@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -462,10 +463,25 @@ func readHelper(content []byte, dest []byte, off int64) (fuse.ReadResult, syscal
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		log.Fatal("Usage: spiffefs <mountpoint>")
+	forceUnmount := flag.Bool("umount", false, "Forcefully unmount the target directory if it is already mounted or stuck")
+	flag.Parse()
+
+	args := flag.Args()
+	if len(args) < 1 {
+		log.Fatal("Usage: spiffefs [-umount] <mountpoint>")
 	}
-	mountPoint := os.Args[1]
+	mountPoint := args[0]
+
+	if *forceUnmount {
+		log.Printf("[FUSE-Engine] Attempting lazy unmount cleanup on: %s", mountPoint)
+		err := unix.Unmount(mountPoint, unix.MNT_DETACH)
+		if err != nil {
+			log.Printf("[FUSE-Engine] Cleanup unmount notice (can be ignored if not previously mounted): %v", err)
+		} else {
+			log.Printf("[FUSE-Engine] Successfully detached previous stale mount at %s", mountPoint)
+			time.Sleep(1 * time.Second)
+		}
+	}
 
 	if envSocket := os.Getenv("SPIFFE_ENDPOINT_SOCKET"); envSocket != "" {
 		spireSocket = envSocket
