@@ -20,6 +20,8 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
       - uses: ko-build/setup-ko@v0.6
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
