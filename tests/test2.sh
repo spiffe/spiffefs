@@ -39,7 +39,7 @@ done
 # lets a reader detect a rotation between reading hints.json and reading a bundle.
 for hint in main other; do
 	bundle=$(bundle_for_hint "${hint}")
-	fingerprint=$(openssl x509 -in "${bundle}" -noout -fingerprint -sha256 | sed 's/^SHA256 Fingerprint=/sha256:/')
+	fingerprint=$(openssl x509 -in "${bundle}" -noout -fingerprint -sha256 | sed 's/^[^=]*=/sha256:/')
 	[[ $(jq -r --arg hint "${hint}" '.hints[] | select(.hint == $hint) | .fingerprint' "${MNT}/hints.json") == "${fingerprint}" ]]
 done
 

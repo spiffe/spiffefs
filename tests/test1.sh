@@ -18,5 +18,5 @@ cat "${MNT}/hints.json"
 [[ $(jq -r '.hints[0].id' "${MNT}/hints.json") == 0 ]]
 
 # The advertised fingerprint has to match the credential bundle it points at.
-fingerprint=$(openssl x509 -in "${MNT}/credential-bundle.private-key.x509.pem" -noout -fingerprint -sha256 | sed 's/^SHA256 Fingerprint=/sha256:/')
+fingerprint=$(openssl x509 -in "${MNT}/credential-bundle.private-key.x509.pem" -noout -fingerprint -sha256 | sed 's/^[^=]*=/sha256:/')
 [[ $(jq -r '.hints[0].fingerprint' "${MNT}/hints.json") == "${fingerprint}" ]]
