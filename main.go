@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -418,8 +421,32 @@ func readHelper(content []byte, dest []byte, off int64) (fuse.ReadResult, syscal
 	return fuse.ReadResultData(content[off:end]), 0
 }
 
+// isFuseMount reports whether path is the mount point of a fuse filesystem.
+// Anything else at that path is not ours to unmount: under a container runtime
+// it is the bind mount the filesystem is served through, and detaching that
+// severs the mount propagation the mount depends on.
+func isFuseMount(path string) bool {
+	f, err := os.Open("/proc/self/mounts")
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 3 {
+			continue
+		}
+		if fields[1] == path && strings.HasPrefix(fields[2], "fuse") {
+			return true
+		}
+	}
+	return false
+}
+
 func main() {
-	forceUnmount := flag.Bool("umount", false, "Forcefully unmount the target directory if it is already mounted or stuck")
+	forceUnmount := flag.Bool("umount", false, "Take ownership of the mount point: clear a stale fuse mount at startup, and unmount on SIGINT or SIGTERM. Without this a mount outliving the process is left disconnected, so reads fail loudly instead of falling through to whatever is underneath.")
 	flag.Parse()
 
 	args := flag.Args()
@@ -429,13 +456,17 @@ func main() {
 	mountPoint := args[0]
 
 	if *forceUnmount {
-		log.Printf("[FUSE-Engine] Attempting lazy unmount cleanup on: %s", mountPoint)
-		err := unix.Unmount(mountPoint, unix.MNT_DETACH)
-		if err != nil {
-			log.Printf("[FUSE-Engine] Cleanup unmount notice (can be ignored if not previously mounted): %v", err)
+		if !isFuseMount(mountPoint) {
+			log.Printf("[FUSE-Engine] Nothing to clean up at %s: it is not a fuse mount", mountPoint)
 		} else {
-			log.Printf("[FUSE-Engine] Successfully detached previous stale mount at %s", mountPoint)
-			time.Sleep(1 * time.Second)
+			log.Printf("[FUSE-Engine] Attempting lazy unmount cleanup on: %s", mountPoint)
+			err := unix.Unmount(mountPoint, unix.MNT_DETACH)
+			if err != nil {
+				log.Printf("[FUSE-Engine] Cleanup unmount notice: %v", err)
+			} else {
+				log.Printf("[FUSE-Engine] Successfully detached previous stale mount at %s", mountPoint)
+				time.Sleep(1 * time.Second)
+			}
 		}
 	}
 
@@ -472,5 +503,30 @@ func main() {
 	}
 
 	log.Printf("SPIRE Transparent-Path FUSE Driver running at: %s", mountPoint)
+
+	// Only unmount on the way out when asked to. A mount that outlives the
+	// process is dead rather than merely idle, and every read of it fails with
+	// ENOTCONN. That is usually what you want: it is louder, and safer, than
+	// reverting the path to whatever sits under the mount point. Under a
+	// container runtime it is not, because the runtime cannot bind a dead mount
+	// and so the replacement instance never starts.
+	if *forceUnmount {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			sig := <-sigChan
+			log.Printf("[FUSE-Engine] Received %s, unmounting %s", sig, mountPoint)
+			if err := server.Unmount(); err != nil {
+				// Unmount refuses while the filesystem is in use, so detach it
+				// instead. Leaving it behind is worse than tearing it out from
+				// under a reader.
+				log.Printf("[FUSE-Engine] Unmount failed: %v. Detaching instead.", err)
+				if err := unix.Unmount(mountPoint, unix.MNT_DETACH); err != nil {
+					log.Printf("[FUSE-Engine] Detach also failed: %v", err)
+				}
+			}
+		}()
+	}
+
 	server.Wait()
 }
