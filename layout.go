@@ -67,22 +67,14 @@ func parseTrustBundleFileName(name string) (string, bool) {
 	return td, true
 }
 
-// certFingerprint renders the SHA-256 of a DER certificate the way
-// `openssl x509 -noout -fingerprint -sha256` does, prefixed with the algorithm
-// so other digests can be introduced later.
-func certFingerprint(der []byte) string {
-	sum := sha256.Sum256(der)
-	encoded := strings.ToUpper(hex.EncodeToString(sum[:]))
-
-	var sb strings.Builder
-	sb.WriteString("sha256:")
-	for i := 0; i < len(encoded); i += 2 {
-		if i > 0 {
-			sb.WriteByte(':')
-		}
-		sb.WriteString(encoded[i : i+2])
-	}
-	return sb.String()
+// bundleFingerprint digests the exact bytes a reader gets from a credential
+// bundle file, so a reader can hash what it read and compare. That makes the
+// check a plain `sha256sum` with no PEM parsing, and it catches a rotation
+// between reading hints.json and reading the bundle. The algorithm is spelled
+// out in the value so other digests can be introduced later.
+func bundleFingerprint(content []byte) string {
+	sum := sha256.Sum256(content)
+	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 // buildHintsJSON renders the hints document for a PID's SVID registry. Every

@@ -96,7 +96,7 @@ func fetchSpireSVIDsForPID(ctx context.Context, socketPath string, pid uint32, u
 			newMap[indexKey] = &SVIDFileSystemState{
 				CredentialBundle: bundle,
 				Hint:             svidWithKey.X509Svid.Hint,
-				Fingerprint:      certFingerprint(svidWithKey.X509Svid.CertChain[0]),
+				Fingerprint:      bundleFingerprint(bundle),
 				TrustDomain:      td,
 			}
 		}

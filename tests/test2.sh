@@ -35,11 +35,12 @@ for bundle in "${main}" "${other}"; do
 	openssl verify -CAfile "${MNT}/example.org.spiffe-trust-bundle.x509.pem" -untrusted /tmp/credential-bundle.pem /tmp/credential-bundle.pem
 done
 
-# Each advertised fingerprint has to match the bundle it points at. This is what
-# lets a reader detect a rotation between reading hints.json and reading a bundle.
+# Each advertised fingerprint has to match a plain hash of the bundle file it
+# points at. This is what lets a reader detect a rotation between reading
+# hints.json and reading a bundle, without parsing any PEM.
 for hint in main other; do
 	bundle=$(bundle_for_hint "${hint}")
-	fingerprint=$(openssl x509 -in "${bundle}" -noout -fingerprint -sha256 | sed 's/^[^=]*=/sha256:/')
+	fingerprint="sha256:$(sha256sum "${bundle}" | cut -d' ' -f1)"
 	[[ $(jq -r --arg hint "${hint}" '.hints[] | select(.hint == $hint) | .fingerprint' "${MNT}/hints.json") == "${fingerprint}" ]]
 done
 

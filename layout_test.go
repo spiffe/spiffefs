@@ -89,27 +89,52 @@ func TestParseTrustBundleFileNameRejects(t *testing.T) {
 	}
 }
 
-func TestCertFingerprint(t *testing.T) {
-	der := []byte("not a real certificate, but the digest does not care")
-	got := certFingerprint(der)
+func TestBundleFingerprint(t *testing.T) {
+	content := []byte("-----BEGIN PRIVATE KEY-----\nnot really\n-----END PRIVATE KEY-----\n")
+	got := bundleFingerprint(content)
 
-	if !strings.HasPrefix(got, "sha256:") {
+	digest, ok := strings.CutPrefix(got, "sha256:")
+	if !ok {
 		t.Fatalf("fingerprint %q is missing the sha256: prefix", got)
 	}
 
-	digest := strings.TrimPrefix(got, "sha256:")
-	pairs := strings.Split(digest, ":")
-	if len(pairs) != sha256.Size {
-		t.Fatalf("fingerprint %q has %d byte pairs, want %d", got, len(pairs), sha256.Size)
+	if len(digest) != hex.EncodedLen(sha256.Size) {
+		t.Errorf("digest %q is %d chars, want %d", digest, len(digest), hex.EncodedLen(sha256.Size))
+	}
+	if strings.Contains(digest, ":") {
+		t.Errorf("digest %q should be unseparated hex, to match sha256sum output", digest)
+	}
+	if digest != strings.ToLower(digest) {
+		t.Errorf("digest %q is not lowercase, so it will not match sha256sum output", digest)
 	}
 
-	if digest != strings.ToUpper(digest) {
-		t.Errorf("fingerprint %q is not uppercase", got)
+	// This is exactly what `sha256sum <file> | cut -d' ' -f1` yields, which is
+	// the comparison a reader is expected to make. The literal below is the
+	// real output of sha256sum over these bytes, so this pins the rendering to
+	// the recipe the integration tests use.
+	sum := sha256.Sum256(content)
+	if want := hex.EncodeToString(sum[:]); digest != want {
+		t.Errorf("digest = %q, want %q", digest, want)
 	}
+	const fromSha256Sum = "sha256:779705ff6e0e1088e22c959aa7a4d198e79a8e387380f1f9d95fbb3a761b2dba"
+	if got != fromSha256Sum {
+		t.Errorf("fingerprint = %q, want %q (as produced by sha256sum)", got, fromSha256Sum)
+	}
+}
 
-	sum := sha256.Sum256(der)
-	if want := strings.ToUpper(hex.EncodeToString(sum[:])); strings.ReplaceAll(digest, ":", "") != want {
-		t.Errorf("fingerprint digest = %q, want %q", digest, want)
+// The fingerprint has to cover the whole file, not just part of it, or a
+// rotation that changes only the key would go undetected.
+func TestBundleFingerprintCoversEntireContent(t *testing.T) {
+	base := []byte("key-block\ncert-block\n")
+
+	if bundleFingerprint(base) == bundleFingerprint([]byte("key-block-rotated\ncert-block\n")) {
+		t.Error("a change in the leading key block must change the fingerprint")
+	}
+	if bundleFingerprint(base) == bundleFingerprint([]byte("key-block\ncert-block-rotated\n")) {
+		t.Error("a change in the trailing cert block must change the fingerprint")
+	}
+	if bundleFingerprint(base) != bundleFingerprint([]byte("key-block\ncert-block\n")) {
+		t.Error("identical content must produce an identical fingerprint")
 	}
 }
 
