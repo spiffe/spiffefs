@@ -115,7 +115,7 @@ sudo systemctl start spire-agent@main
 wait_for_healthcheck spire-agent /var/run/spire/agent/sockets/main/public/api.sock
 
 # Build the code
-go build -o spiffefs spire.go main.go
+go build -o spiffefs .
 
 # Start it up
 mkdir -p /tmp/mnt

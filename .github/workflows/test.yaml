@@ -24,10 +24,13 @@ jobs:
       - name: Install yq
         run: go install github.com/mikefarah/yq/v4@latest
 
-      - name: Install BusyBox
+      - name: Install BusyBox and jq
         run: |
           sudo apt-get update
-          sudo apt-get install -y busybox
+          sudo apt-get install -y busybox jq
+
+      - name: Unit tests
+        run: 'go test ./...'
 
       - name: Run test
         run: 'tests/test.sh'

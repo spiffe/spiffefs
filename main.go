@@ -6,7 +6,8 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"strings"
+	"sort"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -138,124 +139,84 @@ func verifyOrCreatePidState(callerPid uint32) (*PidState, bool) {
 type MainRoot struct {
 	fs.Inode
 }
-var _ fs.NodeOnAdder = (*MainRoot)(nil)
 
-func (r *MainRoot) OnAdd(ctx context.Context) {
-	stableAttr := fs.StableAttr{Mode: syscall.S_IFDIR | 0755}
-	x509Inode := r.NewPersistentInode(ctx, &X509Dir{}, stableAttr)
-	r.AddChild("x509", x509Inode, false)
-}
+var _ fs.NodeLookuper = (*MainRoot)(nil)
+var _ fs.NodeReaddirer = (*MainRoot)(nil)
 
-type X509Dir struct {
-	fs.Inode
-}
-var _ fs.NodeLookuper = (*X509Dir)(nil)
-var _ fs.NodeReaddirer = (*X509Dir)(nil)
-
-func (xd *X509Dir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	caller, ok := fuse.FromContext(ctx)
-	if !ok { return nil, syscall.EIO }
-
-	state, alive := verifyOrCreatePidState(caller.Pid)
-	if !alive { return nil, syscall.EACCES }
-
-	stateMutex.RLock()
-	_, exists := state.SvidRegistry[name]
-	stateMutex.RUnlock()
-
-	if !exists {
-		return nil, syscall.ENOENT
-	}
-
-	stableAttr := fs.StableAttr{Mode: syscall.S_IFDIR | 0755}
-	childNode := xd.NewPersistentInode(ctx, &IndexDir{indexName: name}, stableAttr)
-
-	out.EntryValid = 0
-	out.AttrValid = 0
-	return childNode, 0
-}
-
-func (xd *X509Dir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
-	caller, ok := fuse.FromContext(ctx)
-	if !ok { return nil, syscall.EIO }
-
-	state, alive := verifyOrCreatePidState(caller.Pid)
-	if !alive { return nil, syscall.EACCES }
-
-	stateMutex.RLock()
-	var entries []fuse.DirEntry
-	for k := range state.SvidRegistry {
-		entries = append(entries, fuse.DirEntry{
-			Name: k,
-			Mode: syscall.S_IFDIR,
-		})
-	}
-	stateMutex.RUnlock()
-	return fs.NewListDirStream(entries), 0
-}
-
-type IndexDir struct {
-	fs.Inode
-	indexName string
-}
-var _ fs.NodeLookuper = (*IndexDir)(nil)
-var _ fs.NodeReaddirer = (*IndexDir)(nil)
-
-func (id *IndexDir) getBundleTargetDomains(pid uint32) ([]string, syscall.Errno) {
+// bundleTargetDomains returns the trust domains this PID should be handed a
+// bundle for: its own SVIDs' domains plus everything it federates with, minus
+// any domain we have not actually received a bundle for. Deduped and sorted so
+// readdir output is stable.
+func bundleTargetDomains(pid uint32) ([]string, syscall.Errno) {
 	stateMutex.RLock()
 	state, exists := pidRegistry[pid]
 	if !exists {
 		stateMutex.RUnlock()
 		return nil, syscall.ENOENT
 	}
-	svid, found := state.SvidRegistry[id.indexName]
-	var domains []string
-	if found && svid.TrustDomain != "" {
-		domains = append(domains, svid.TrustDomain)
+
+	seen := make(map[string]bool)
+	for _, svid := range state.SvidRegistry {
+		if svid.TrustDomain != "" {
+			seen[svid.TrustDomain] = true
+		}
 	}
-	if found {
-		domains = append(domains, state.FederatedTrustDomains...)
+	for _, td := range state.FederatedTrustDomains {
+		if td != "" {
+			seen[td] = true
+		}
 	}
 	stateMutex.RUnlock()
+
+	var domains []string
+	bundleMutex.RLock()
+	for td := range seen {
+		if _, ok := globalBundles[td]; ok {
+			domains = append(domains, td)
+		}
+	}
+	bundleMutex.RUnlock()
+
+	sort.Strings(domains)
 	return domains, 0
 }
 
-func (id *IndexDir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+func (r *MainRoot) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	caller, ok := fuse.FromContext(ctx)
 	if !ok { return nil, syscall.EIO }
 
 	state, alive := verifyOrCreatePidState(caller.Pid)
 	if !alive { return nil, syscall.EACCES }
 
-	stateMutex.RLock()
-	svid, found := state.SvidRegistry[id.indexName]
-	stateMutex.RUnlock()
+	fileAttr := fs.StableAttr{Mode: syscall.S_IFREG | 0644}
 
-	if !found { return nil, syscall.ENOENT }
+	out.EntryValid = 0
+	out.AttrValid = 0
 
-	stableAttr := fs.StableAttr{Mode: syscall.S_IFREG | 0644}
-
-	if name == "credential-bundle.pem" {
-		return id.NewPersistentInode(ctx, &BundleFile{indexName: id.indexName}, stableAttr), 0
-	}
-	if name == "hint" && svid.HasHint {
-		return id.NewPersistentInode(ctx, &HintFile{indexName: id.indexName}, stableAttr), 0
+	if name == hintsFileName {
+		return r.NewPersistentInode(ctx, &HintsFile{}, fileAttr), 0
 	}
 
-	if strings.HasSuffix(name, ".spiffe-trust-bundle.pem") {
-		targetDomain := strings.TrimSuffix(name, ".spiffe-trust-bundle.pem")
-		domains, err := id.getBundleTargetDomains(caller.Pid)
+	if idx, ok := parseCredentialBundleFileName(name); ok {
+		indexName := fmt.Sprintf("%d", idx)
+
+		stateMutex.RLock()
+		_, found := state.SvidRegistry[indexName]
+		stateMutex.RUnlock()
+
+		if found {
+			return r.NewPersistentInode(ctx, &BundleFile{indexName: indexName}, fileAttr), 0
+		}
+		return nil, syscall.ENOENT
+	}
+
+	if targetDomain, ok := parseTrustBundleFileName(name); ok {
+		domains, err := bundleTargetDomains(caller.Pid)
 		if err != 0 { return nil, err }
 
 		for _, td := range domains {
 			if td == targetDomain {
-				bundleMutex.RLock()
-				_, bundleExists := globalBundles[td]
-				bundleMutex.RUnlock()
-
-				if bundleExists {
-					return id.NewPersistentInode(ctx, &TrustBundleFile{trustDomain: td}, stableAttr), 0
-				}
+				return r.NewPersistentInode(ctx, &TrustBundleFile{trustDomain: td}, fileAttr), 0
 			}
 		}
 	}
@@ -263,42 +224,41 @@ func (id *IndexDir) Lookup(ctx context.Context, name string, out *fuse.EntryOut)
 	return nil, syscall.ENOENT
 }
 
-func (id *IndexDir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+func (r *MainRoot) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	caller, ok := fuse.FromContext(ctx)
 	if !ok { return nil, syscall.EIO }
 
 	state, alive := verifyOrCreatePidState(caller.Pid)
 	if !alive { return nil, syscall.EACCES }
 
+	entries := []fuse.DirEntry{
+		{Name: hintsFileName, Mode: syscall.S_IFREG},
+	}
+
 	stateMutex.RLock()
-	svid, found := state.SvidRegistry[id.indexName]
+	for key := range state.SvidRegistry {
+		idx, err := strconv.Atoi(key)
+		if err != nil {
+			continue
+		}
+		entries = append(entries, fuse.DirEntry{
+			Name: credentialBundleFileName(idx),
+			Mode: syscall.S_IFREG,
+		})
+	}
 	stateMutex.RUnlock()
 
-	if !found { return nil, syscall.ENOENT }
-
-	entries := []fuse.DirEntry{
-		{Name: "credential-bundle.pem", Mode: syscall.S_IFREG},
-	}
-	if svid.HasHint {
-		entries = append(entries, fuse.DirEntry{Name: "hint", Mode: syscall.S_IFREG})
-	}
-
-	domains, err := id.getBundleTargetDomains(caller.Pid)
+	domains, err := bundleTargetDomains(caller.Pid)
 	if err == 0 {
-		bundleMutex.RLock()
-		seen := make(map[string]bool)
 		for _, td := range domains {
-			if _, exists := globalBundles[td]; exists && !seen[td] {
-				seen[td] = true
-				entries = append(entries, fuse.DirEntry{
-					Name: fmt.Sprintf("%s.spiffe-trust-bundle.pem", td),
-					Mode: syscall.S_IFREG,
-				})
-			}
+			entries = append(entries, fuse.DirEntry{
+				Name: trustBundleFileName(td),
+				Mode: syscall.S_IFREG,
+			})
 		}
-		bundleMutex.RUnlock()
 	}
 
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
 	return fs.NewListDirStream(entries), 0
 }
 
@@ -398,37 +358,41 @@ func (b *BundleFile) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.At
 	return 0
 }
 
-type HintFile struct { fs.Inode; indexName string }
-var _ fs.NodeOpener = (*HintFile)(nil)
-var _ fs.NodeReader = (*HintFile)(nil)
-var _ fs.NodeGetattrer = (*HintFile)(nil)
+type HintsFile struct { fs.Inode }
+var _ fs.NodeOpener = (*HintsFile)(nil)
+var _ fs.NodeReader = (*HintsFile)(nil)
+var _ fs.NodeGetattrer = (*HintsFile)(nil)
 
-func (h *HintFile) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+// hintsContentForPid renders the hints document for the calling process. An
+// empty registry is not an error; it renders as an empty hints array.
+func hintsContentForPid(ctx context.Context) ([]byte, syscall.Errno) {
 	caller, ok := fuse.FromContext(ctx)
-	if !ok { return nil, 0, syscall.EACCES }
-	if _, alive := verifyOrCreatePidState(caller.Pid); !alive { return nil, 0, syscall.EACCES }
+	if !ok { return nil, syscall.EACCES }
+
+	state, alive := verifyOrCreatePidState(caller.Pid)
+	if !alive { return nil, syscall.EACCES }
 
 	stateMutex.RLock()
-	state, exists := pidRegistry[caller.Pid]
-	if !exists {
-		stateMutex.RUnlock()
-		return nil, 0, syscall.EIO
-	}
-	svid, found := state.SvidRegistry[h.indexName]
+	content, err := buildHintsJSON(state.SvidRegistry)
 	stateMutex.RUnlock()
-	if !found || !svid.HasHint { return nil, 0, syscall.EIO }
-
-	content := []byte(svid.Hint + "\n")
-	snapshot := make([]byte, len(content))
-	copy(snapshot, content)
-	return &snapshotHandle{content: snapshot}, fuse.FOPEN_NONSEEKABLE, 0
+	if err != nil {
+		log.Printf("[Hints] Failed rendering hints for PID %d: %v", caller.Pid, err)
+		return nil, syscall.EIO
+	}
+	return content, 0
 }
 
-func (h *HintFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+func (h *HintsFile) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	content, errno := hintsContentForPid(ctx)
+	if errno != 0 { return nil, 0, errno }
+	return &snapshotHandle{content: content}, fuse.FOPEN_NONSEEKABLE, 0
+}
+
+func (h *HintsFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	return readHelper(fh.(*snapshotHandle).content, dest, off)
 }
 
-func (h *HintFile) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+func (h *HintsFile) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	if fh != nil {
 		if sh, ok := fh.(*snapshotHandle); ok {
 			out.Mode = syscall.S_IFREG | 0644
@@ -436,18 +400,10 @@ func (h *HintFile) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.Attr
 			return 0
 		}
 	}
-	caller, ok := fuse.FromContext(ctx)
-	if !ok { return syscall.EACCES }
-
-	state, alive := verifyOrCreatePidState(caller.Pid)
-	if !alive { return syscall.EACCES }
-
-	stateMutex.RLock()
-	svid, found := state.SvidRegistry[h.indexName]
-	stateMutex.RUnlock()
-	if !found || !svid.HasHint { return syscall.EIO }
+	content, errno := hintsContentForPid(ctx)
+	if errno != 0 { return errno }
 	out.Mode = syscall.S_IFREG | 0644
-	out.Size = uint64(len(svid.Hint) + 1)
+	out.Size = uint64(len(content))
 	return 0
 }
 

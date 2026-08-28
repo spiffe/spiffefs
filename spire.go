@@ -19,7 +19,7 @@ import (
 type SVIDFileSystemState struct {
 	CredentialBundle []byte
 	Hint             string
-	HasHint          bool
+	Fingerprint      string
 	TrustDomain      string
 }
 
@@ -96,7 +96,7 @@ func fetchSpireSVIDsForPID(ctx context.Context, socketPath string, pid uint32, u
 			newMap[indexKey] = &SVIDFileSystemState{
 				CredentialBundle: bundle,
 				Hint:             svidWithKey.X509Svid.Hint,
-				HasHint:          svidWithKey.X509Svid.Hint != "",
+				Fingerprint:      certFingerprint(svidWithKey.X509Svid.CertChain[0]),
 				TrustDomain:      td,
 			}
 		}
