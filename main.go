@@ -197,6 +197,9 @@ func (r *MainRoot) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 	out.AttrValid = 0
 
 	if name == hintsFileName {
+		content, errno := hintsContentForPid(ctx)
+		if errno != 0 { return nil, errno }
+		setLookupAttr(out, len(content))
 		return r.NewPersistentInode(ctx, &HintsFile{}, fileAttr), 0
 	}
 
@@ -204,10 +207,15 @@ func (r *MainRoot) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 		indexName := fmt.Sprintf("%d", idx)
 
 		stateMutex.RLock()
-		_, found := state.SvidRegistry[indexName]
+		svid, found := state.SvidRegistry[indexName]
+		var size int
+		if found {
+			size = len(svid.CredentialBundle)
+		}
 		stateMutex.RUnlock()
 
 		if found {
+			setLookupAttr(out, size)
 			return r.NewPersistentInode(ctx, &BundleFile{indexName: indexName}, fileAttr), 0
 		}
 		return nil, syscall.ENOENT
@@ -219,12 +227,28 @@ func (r *MainRoot) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 
 		for _, td := range domains {
 			if td == targetDomain {
+				bundleMutex.RLock()
+				size := len(globalBundles[td])
+				bundleMutex.RUnlock()
+
+				setLookupAttr(out, size)
 				return r.NewPersistentInode(ctx, &TrustBundleFile{trustDomain: td}, fileAttr), 0
 			}
 		}
 	}
 
 	return nil, syscall.ENOENT
+}
+
+// setLookupAttr reports the file's size in the lookup reply. Without it the
+// kernel takes i_size to be 0, and a reader that splices rather than reads --
+// sendfile(2), which is what busybox cat does when its output is a pipe -- gets
+// nothing back and reports a clean EOF. The read path is unaffected because it
+// issues its own getattr first. Nothing is cached here: attrValid stays zero, so
+// the kernel still asks again next time.
+func setLookupAttr(out *fuse.EntryOut, size int) {
+	out.Attr.Mode = syscall.S_IFREG | 0644
+	out.Attr.Size = uint64(size)
 }
 
 func (r *MainRoot) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
@@ -445,6 +469,22 @@ func isFuseMount(path string) bool {
 	return false
 }
 
+// mountOptions is shared with the tests so they exercise the same settings the
+// binary runs with. Nothing is cached: the filesystem serves different content
+// to different callers, so a kernel cache shared across them could hand one
+// workload another's credentials.
+func mountOptions() *fs.Options {
+	zeroDuration := time.Duration(0)
+	return &fs.Options{
+		EntryTimeout: &zeroDuration,
+		AttrTimeout:  &zeroDuration,
+		MountOptions: fuse.MountOptions{
+			AllowOther:  true,
+			DirectMount: true,
+		},
+	}
+}
+
 func main() {
 	forceUnmount := flag.Bool("umount", false, "Take ownership of the mount point: clear a stale fuse mount at startup, and unmount on SIGINT or SIGTERM. Without this a mount outliving the process is left disconnected, so reads fail loudly instead of falling through to whatever is underneath.")
 	flag.Parse()
@@ -486,18 +526,8 @@ func main() {
 	}
 
 	root := &MainRoot{}
-	zeroDuration := time.Duration(0)
 
-	opts := &fs.Options{
-		EntryTimeout: &zeroDuration,
-		AttrTimeout:  &zeroDuration,
-		MountOptions: fuse.MountOptions{
-			AllowOther: true,
-			DirectMount: true,
-		},
-	}
-
-	server, err := fs.Mount(mountPoint, root, opts)
+	server, err := fs.Mount(mountPoint, root, mountOptions())
 	if err != nil {
 		log.Fatalf("Mount initialization failed: %v", err)
 	}
