@@ -123,8 +123,28 @@ go build -o spiffefs .
 mkdir -p /tmp/mnt
 sudo ./spiffefs /tmp/mnt &
 
-#FIXME wait for spiffefs startup.... probably needs a health check to fix.
-sleep 15
+# Wait for what the tests actually need, rather than guessing at a duration. The
+# mount appears within a second or two, but the trust bundles arrive separately:
+# they come from a stream that backs off and retries, so credentials can be
+# served before any bundle is. A fixed sleep raced that and failed on the slower
+# runners.
+wait_for_spiffefs() {
+  local timeout=120
+  local count=0
+  while [ "${count}" -lt "${timeout}" ]; do
+    if mountpoint -q /tmp/mnt &&
+       [ -s /tmp/mnt/hints.json ] &&
+       [ -s /tmp/mnt/example.org.spiffe-trust-bundle.x509.pem ]; then
+      return 0
+    fi
+    sleep 2
+    count=$((count + 2))
+  done
+  echo "spiffefs did not serve a trust bundle within ${timeout}s"
+  ls -la /tmp/mnt/ || true
+  return 1
+}
+wait_for_spiffefs
 
 sudo cp tests/test*.sh /usr/libexec/
 sudo cp tests/systemd/test*.service /etc/systemd/system

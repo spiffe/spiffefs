@@ -46,6 +46,41 @@ func isPidFdAlive(fd int) bool {
 	return n == 0
 }
 
+// callerPid returns the process the request came from. fuse reports the id of
+// the calling *thread*, which for anything but the group leader is not the
+// process id: pidfd_open rejects it, and credentials belong to the process
+// rather than to whichever of its threads happened to make the call. A
+// multithreaded workload would otherwise see reads fail with EACCES depending
+// on which thread serviced them.
+func callerPid(ctx context.Context) (uint32, bool) {
+	caller, ok := fuse.FromContext(ctx)
+	if !ok {
+		return 0, false
+	}
+	return threadGroupLeader(caller.Pid), true
+}
+
+// threadGroupLeader maps a thread id to the process it belongs to. A pid that is
+// already a group leader maps to itself, so this is safe to apply to any id.
+func threadGroupLeader(pid uint32) uint32 {
+	status, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		// The caller may already be gone. Leave the id alone and let the
+		// existing pidfd handling report it.
+		return pid
+	}
+	for _, line := range strings.Split(string(status), "\n") {
+		rest, ok := strings.CutPrefix(line, "Tgid:")
+		if !ok {
+			continue
+		}
+		if tgid, err := strconv.Atoi(strings.TrimSpace(rest)); err == nil && tgid > 0 {
+			return uint32(tgid)
+		}
+	}
+	return pid
+}
+
 func verifyOrCreatePidState(callerPid uint32) (*PidState, bool) {
 	if callerPid == 0 {
 		return nil, false
@@ -185,10 +220,10 @@ func bundleTargetDomains(pid uint32) ([]string, syscall.Errno) {
 }
 
 func (r *MainRoot) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	caller, ok := fuse.FromContext(ctx)
+	pid, ok := callerPid(ctx)
 	if !ok { return nil, syscall.EIO }
 
-	state, alive := verifyOrCreatePidState(caller.Pid)
+	state, alive := verifyOrCreatePidState(pid)
 	if !alive { return nil, syscall.EACCES }
 
 	fileAttr := fs.StableAttr{Mode: syscall.S_IFREG | 0644}
@@ -222,7 +257,7 @@ func (r *MainRoot) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 	}
 
 	if targetDomain, ok := parseTrustBundleFileName(name); ok {
-		domains, err := bundleTargetDomains(caller.Pid)
+		domains, err := bundleTargetDomains(pid)
 		if err != 0 { return nil, err }
 
 		for _, td := range domains {
@@ -252,10 +287,10 @@ func setLookupAttr(out *fuse.EntryOut, size int) {
 }
 
 func (r *MainRoot) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
-	caller, ok := fuse.FromContext(ctx)
+	pid, ok := callerPid(ctx)
 	if !ok { return nil, syscall.EIO }
 
-	state, alive := verifyOrCreatePidState(caller.Pid)
+	state, alive := verifyOrCreatePidState(pid)
 	if !alive { return nil, syscall.EACCES }
 
 	entries := []fuse.DirEntry{
@@ -275,7 +310,7 @@ func (r *MainRoot) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	}
 	stateMutex.RUnlock()
 
-	domains, err := bundleTargetDomains(caller.Pid)
+	domains, err := bundleTargetDomains(pid)
 	if err == 0 {
 		for _, td := range domains {
 			entries = append(entries, fuse.DirEntry{
@@ -351,12 +386,12 @@ var _ fs.NodeReader = (*BundleFile)(nil)
 var _ fs.NodeGetattrer = (*BundleFile)(nil)
 
 func (b *BundleFile) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
-	caller, ok := fuse.FromContext(ctx)
+	pid, ok := callerPid(ctx)
 	if !ok { return nil, 0, syscall.EACCES }
-	if _, alive := verifyOrCreatePidState(caller.Pid); !alive { return nil, 0, syscall.EACCES }
+	if _, alive := verifyOrCreatePidState(pid); !alive { return nil, 0, syscall.EACCES }
 
 	stateMutex.RLock()
-	state, exists := pidRegistry[caller.Pid]
+	state, exists := pidRegistry[pid]
 	if !exists {
 		stateMutex.RUnlock()
 		return nil, 0, syscall.EIO
@@ -382,10 +417,10 @@ func (b *BundleFile) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.At
 			return 0
 		}
 	}
-	caller, ok := fuse.FromContext(ctx)
+	pid, ok := callerPid(ctx)
 	if !ok { return syscall.EACCES }
 
-	state, alive := verifyOrCreatePidState(caller.Pid)
+	state, alive := verifyOrCreatePidState(pid)
 	if !alive { return syscall.EACCES }
 
 	stateMutex.RLock()
@@ -405,17 +440,17 @@ var _ fs.NodeGetattrer = (*HintsFile)(nil)
 // hintsContentForPid renders the hints document for the calling process. An
 // empty registry is not an error; it renders as an empty hints array.
 func hintsContentForPid(ctx context.Context) ([]byte, syscall.Errno) {
-	caller, ok := fuse.FromContext(ctx)
+	pid, ok := callerPid(ctx)
 	if !ok { return nil, syscall.EACCES }
 
-	state, alive := verifyOrCreatePidState(caller.Pid)
+	state, alive := verifyOrCreatePidState(pid)
 	if !alive { return nil, syscall.EACCES }
 
 	stateMutex.RLock()
 	content, err := buildHintsJSON(state.SvidRegistry)
 	stateMutex.RUnlock()
 	if err != nil {
-		log.Printf("[Hints] Failed rendering hints for PID %d: %v", caller.Pid, err)
+		log.Printf("[Hints] Failed rendering hints for PID %d: %v", pid, err)
 		return nil, syscall.EIO
 	}
 	return content, 0

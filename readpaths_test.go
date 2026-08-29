@@ -5,7 +5,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/hanwen/go-fuse/v2/fs"
@@ -286,6 +288,82 @@ func TestSameLengthContentIsNeverServedFromCache(t *testing.T) {
 	}
 	if !bytes.Equal(second, swapped) {
 		t.Fatalf("a read after a same-length change returned stale bytes; the kernel cached them")
+	}
+}
+
+// fuse reports the calling thread's id, not the process id, and pidfd_open
+// refuses any id that is not a thread group leader. Without mapping the thread
+// back to its process, a read serviced by a worker thread fails with EACCES,
+// so any multithreaded workload sees intermittent permission denied on its own
+// credentials. Hold several goroutines on their own OS threads at once so the
+// runtime cannot quietly run them all on the leader.
+func TestReadsFromWorkerThreadsAreAllowed(t *testing.T) {
+	seedReadPathState(t)
+	dir := mountForTest(t)
+	path := filepath.Join(dir, hintsFileName)
+
+	const workers = 8
+	var wg, barrier sync.WaitGroup
+	barrier.Add(1)
+	errs := make([]error, workers)
+	tids := make([]int, workers)
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			runtime.LockOSThread()
+			defer runtime.UnlockOSThread()
+			tids[i] = unix.Gettid()
+			barrier.Wait()
+			_, errs[i] = os.ReadFile(path)
+		}(i)
+	}
+	runtime.Gosched()
+	barrier.Done()
+	wg.Wait()
+
+	offLeader := 0
+	for i := range tids {
+		if tids[i] != os.Getpid() {
+			offLeader++
+		}
+		if errs[i] != nil {
+			t.Errorf("read from thread %d failed: %v", tids[i], errs[i])
+		}
+	}
+	if offLeader == 0 {
+		t.Skip("every goroutine ran on the group leader, so nothing was exercised")
+	}
+	t.Logf("%d of %d reads came from threads other than the leader", offLeader, workers)
+}
+
+// A thread id maps to its process; a process id maps to itself.
+func TestThreadGroupLeader(t *testing.T) {
+	pid := uint32(os.Getpid())
+	if got := threadGroupLeader(pid); got != pid {
+		t.Errorf("threadGroupLeader(%d) = %d, want itself", pid, got)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		tid := uint32(unix.Gettid())
+		if tid == pid {
+			return
+		}
+		if got := threadGroupLeader(tid); got != pid {
+			t.Errorf("threadGroupLeader(tid %d) = %d, want the process %d", tid, got, pid)
+		}
+	}()
+	<-done
+
+	// A pid that no longer exists is left alone rather than being rewritten.
+	const gone = uint32(0x7FFFFFF0)
+	if got := threadGroupLeader(gone); got != gone {
+		t.Errorf("threadGroupLeader(%d) = %d, want it unchanged", gone, got)
 	}
 }
 
