@@ -8,8 +8,68 @@ on:
     types: [synchronize, opened, reopened]
 
 jobs:
+  # Fast, and needs neither SPIRE nor Kubernetes: it mounts the filesystem
+  # against the real kernel and drives the read syscalls directly. Which syscall
+  # a reader picks varies by tool and version, so asserting through cat or
+  # busybox tests those rather than us.
+  read-paths:
+    # Whether a read is answered depends on kernel behaviour that has already
+    # differed between versions, so run the widest spread of runners on offer:
+    # oldest to newest, on both architectures.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-22.04
+          - ubuntu-22.04-arm
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+          # Preview images. Drop these if they stop being offered.
+          - ubuntu-26.04
+          - ubuntu-26.04-arm
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Setup go
+        uses: actions/setup-go@v6.4.0
+        with:
+          go-version: '1.26'
+          cache: false
+
+      - name: Show kernel and architecture
+        # Named in the log so a failure points at a kernel rather than a runner
+        # label, and so the spread actually covered is visible.
+        run: uname -srm
+
+      - name: Unit tests
+        run: 'go test ./...'
+
+      - name: Read paths against a real fuse mount
+        # Mounting needs privileges, so this cannot run as the normal user. The
+        # test skips itself rather than failing when it cannot mount.
+        run: sudo env "PATH=$PATH" "GOFLAGS=$GOFLAGS" go test -v -run TestReadPaths ./...
+
   tests:
-    runs-on: ubuntu-24.04
+    # The same spread as the read paths job. This one is far heavier, since each
+    # run builds a cluster, but it is the only place the filesystem is exercised
+    # by real workloads, so kernel differences matter here too.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-22.04
+          - ubuntu-22.04-arm
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+          # Preview images. Drop these if they stop being offered.
+          - ubuntu-26.04
+          - ubuntu-26.04-arm
+
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - name: Checkout
@@ -24,10 +84,16 @@ jobs:
       - name: Install yq
         run: go install github.com/mikefarah/yq/v4@latest
 
-      - name: Install BusyBox
+      - name: Show kernel and architecture
+        run: uname -srm
+
+      - name: Install BusyBox and jq
         run: |
           sudo apt-get update
-          sudo apt-get install -y busybox
+          sudo apt-get install -y busybox jq
+
+      - name: Unit tests
+        run: 'go test ./...'
 
       - name: Run test
         run: 'tests/test.sh'

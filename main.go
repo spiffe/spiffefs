@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -40,6 +44,41 @@ func isPidFdAlive(fd int) bool {
 		return false
 	}
 	return n == 0
+}
+
+// callerPid returns the process the request came from. fuse reports the id of
+// the calling *thread*, which for anything but the group leader is not the
+// process id: pidfd_open rejects it, and credentials belong to the process
+// rather than to whichever of its threads happened to make the call. A
+// multithreaded workload would otherwise see reads fail with EACCES depending
+// on which thread serviced them.
+func callerPid(ctx context.Context) (uint32, bool) {
+	caller, ok := fuse.FromContext(ctx)
+	if !ok {
+		return 0, false
+	}
+	return threadGroupLeader(caller.Pid), true
+}
+
+// threadGroupLeader maps a thread id to the process it belongs to. A pid that is
+// already a group leader maps to itself, so this is safe to apply to any id.
+func threadGroupLeader(pid uint32) uint32 {
+	status, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		// The caller may already be gone. Leave the id alone and let the
+		// existing pidfd handling report it.
+		return pid
+	}
+	for _, line := range strings.Split(string(status), "\n") {
+		rest, ok := strings.CutPrefix(line, "Tgid:")
+		if !ok {
+			continue
+		}
+		if tgid, err := strconv.Atoi(strings.TrimSpace(rest)); err == nil && tgid > 0 {
+			return uint32(tgid)
+		}
+	}
+	return pid
 }
 
 func verifyOrCreatePidState(callerPid uint32) (*PidState, bool) {
@@ -138,124 +177,97 @@ func verifyOrCreatePidState(callerPid uint32) (*PidState, bool) {
 type MainRoot struct {
 	fs.Inode
 }
-var _ fs.NodeOnAdder = (*MainRoot)(nil)
 
-func (r *MainRoot) OnAdd(ctx context.Context) {
-	stableAttr := fs.StableAttr{Mode: syscall.S_IFDIR | 0755}
-	x509Inode := r.NewPersistentInode(ctx, &X509Dir{}, stableAttr)
-	r.AddChild("x509", x509Inode, false)
-}
+var _ fs.NodeLookuper = (*MainRoot)(nil)
+var _ fs.NodeReaddirer = (*MainRoot)(nil)
 
-type X509Dir struct {
-	fs.Inode
-}
-var _ fs.NodeLookuper = (*X509Dir)(nil)
-var _ fs.NodeReaddirer = (*X509Dir)(nil)
-
-func (xd *X509Dir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	caller, ok := fuse.FromContext(ctx)
-	if !ok { return nil, syscall.EIO }
-
-	state, alive := verifyOrCreatePidState(caller.Pid)
-	if !alive { return nil, syscall.EACCES }
-
-	stateMutex.RLock()
-	_, exists := state.SvidRegistry[name]
-	stateMutex.RUnlock()
-
-	if !exists {
-		return nil, syscall.ENOENT
-	}
-
-	stableAttr := fs.StableAttr{Mode: syscall.S_IFDIR | 0755}
-	childNode := xd.NewPersistentInode(ctx, &IndexDir{indexName: name}, stableAttr)
-
-	out.EntryValid = 0
-	out.AttrValid = 0
-	return childNode, 0
-}
-
-func (xd *X509Dir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
-	caller, ok := fuse.FromContext(ctx)
-	if !ok { return nil, syscall.EIO }
-
-	state, alive := verifyOrCreatePidState(caller.Pid)
-	if !alive { return nil, syscall.EACCES }
-
-	stateMutex.RLock()
-	var entries []fuse.DirEntry
-	for k := range state.SvidRegistry {
-		entries = append(entries, fuse.DirEntry{
-			Name: k,
-			Mode: syscall.S_IFDIR,
-		})
-	}
-	stateMutex.RUnlock()
-	return fs.NewListDirStream(entries), 0
-}
-
-type IndexDir struct {
-	fs.Inode
-	indexName string
-}
-var _ fs.NodeLookuper = (*IndexDir)(nil)
-var _ fs.NodeReaddirer = (*IndexDir)(nil)
-
-func (id *IndexDir) getBundleTargetDomains(pid uint32) ([]string, syscall.Errno) {
+// bundleTargetDomains returns the trust domains this PID should be handed a
+// bundle for: its own SVIDs' domains plus everything it federates with, minus
+// any domain we have not actually received a bundle for. Deduped and sorted so
+// readdir output is stable.
+func bundleTargetDomains(pid uint32) ([]string, syscall.Errno) {
 	stateMutex.RLock()
 	state, exists := pidRegistry[pid]
 	if !exists {
 		stateMutex.RUnlock()
 		return nil, syscall.ENOENT
 	}
-	svid, found := state.SvidRegistry[id.indexName]
-	var domains []string
-	if found && svid.TrustDomain != "" {
-		domains = append(domains, svid.TrustDomain)
+
+	seen := make(map[string]bool)
+	for _, svid := range state.SvidRegistry {
+		if svid.TrustDomain != "" {
+			seen[svid.TrustDomain] = true
+		}
 	}
-	if found {
-		domains = append(domains, state.FederatedTrustDomains...)
+	for _, td := range state.FederatedTrustDomains {
+		if td != "" {
+			seen[td] = true
+		}
 	}
 	stateMutex.RUnlock()
+
+	var domains []string
+	bundleMutex.RLock()
+	for td := range seen {
+		if _, ok := globalBundles[td]; ok {
+			domains = append(domains, td)
+		}
+	}
+	bundleMutex.RUnlock()
+
+	sort.Strings(domains)
 	return domains, 0
 }
 
-func (id *IndexDir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	caller, ok := fuse.FromContext(ctx)
+func (r *MainRoot) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	pid, ok := callerPid(ctx)
 	if !ok { return nil, syscall.EIO }
 
-	state, alive := verifyOrCreatePidState(caller.Pid)
+	state, alive := verifyOrCreatePidState(pid)
 	if !alive { return nil, syscall.EACCES }
 
-	stateMutex.RLock()
-	svid, found := state.SvidRegistry[id.indexName]
-	stateMutex.RUnlock()
+	fileAttr := fs.StableAttr{Mode: syscall.S_IFREG | 0644}
 
-	if !found { return nil, syscall.ENOENT }
+	out.EntryValid = 0
+	out.AttrValid = 0
 
-	stableAttr := fs.StableAttr{Mode: syscall.S_IFREG | 0644}
-
-	if name == "credential-bundle.pem" {
-		return id.NewPersistentInode(ctx, &BundleFile{indexName: id.indexName}, stableAttr), 0
-	}
-	if name == "hint" && svid.HasHint {
-		return id.NewPersistentInode(ctx, &HintFile{indexName: id.indexName}, stableAttr), 0
+	if name == hintsFileName {
+		content, errno := hintsContentForPid(ctx)
+		if errno != 0 { return nil, errno }
+		setLookupAttr(out, len(content))
+		return r.NewPersistentInode(ctx, &HintsFile{}, fileAttr), 0
 	}
 
-	if strings.HasSuffix(name, ".spiffe-trust-bundle.pem") {
-		targetDomain := strings.TrimSuffix(name, ".spiffe-trust-bundle.pem")
-		domains, err := id.getBundleTargetDomains(caller.Pid)
+	if idx, ok := parseCredentialBundleFileName(name); ok {
+		indexName := fmt.Sprintf("%d", idx)
+
+		stateMutex.RLock()
+		svid, found := state.SvidRegistry[indexName]
+		var size int
+		if found {
+			size = len(svid.CredentialBundle)
+		}
+		stateMutex.RUnlock()
+
+		if found {
+			setLookupAttr(out, size)
+			return r.NewPersistentInode(ctx, &BundleFile{indexName: indexName}, fileAttr), 0
+		}
+		return nil, syscall.ENOENT
+	}
+
+	if targetDomain, ok := parseTrustBundleFileName(name); ok {
+		domains, err := bundleTargetDomains(pid)
 		if err != 0 { return nil, err }
 
 		for _, td := range domains {
 			if td == targetDomain {
 				bundleMutex.RLock()
-				_, bundleExists := globalBundles[td]
+				size := len(globalBundles[td])
 				bundleMutex.RUnlock()
 
-				if bundleExists {
-					return id.NewPersistentInode(ctx, &TrustBundleFile{trustDomain: td}, stableAttr), 0
-				}
+				setLookupAttr(out, size)
+				return r.NewPersistentInode(ctx, &TrustBundleFile{trustDomain: td}, fileAttr), 0
 			}
 		}
 	}
@@ -263,48 +275,70 @@ func (id *IndexDir) Lookup(ctx context.Context, name string, out *fuse.EntryOut)
 	return nil, syscall.ENOENT
 }
 
-func (id *IndexDir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
-	caller, ok := fuse.FromContext(ctx)
+// setLookupAttr reports the file's size in the lookup reply. Without it the
+// kernel takes i_size to be 0, and a reader that splices rather than reads --
+// sendfile(2), which is what busybox cat does when its output is a pipe -- gets
+// nothing back and reports a clean EOF. The read path is unaffected because it
+// issues its own getattr first. Nothing is cached here: attrValid stays zero, so
+// the kernel still asks again next time.
+func setLookupAttr(out *fuse.EntryOut, size int) {
+	out.Attr.Mode = syscall.S_IFREG | 0644
+	out.Attr.Size = uint64(size)
+}
+
+func (r *MainRoot) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	pid, ok := callerPid(ctx)
 	if !ok { return nil, syscall.EIO }
 
-	state, alive := verifyOrCreatePidState(caller.Pid)
+	state, alive := verifyOrCreatePidState(pid)
 	if !alive { return nil, syscall.EACCES }
 
+	entries := []fuse.DirEntry{
+		{Name: hintsFileName, Mode: syscall.S_IFREG},
+	}
+
 	stateMutex.RLock()
-	svid, found := state.SvidRegistry[id.indexName]
+	for key := range state.SvidRegistry {
+		idx, err := strconv.Atoi(key)
+		if err != nil {
+			continue
+		}
+		entries = append(entries, fuse.DirEntry{
+			Name: credentialBundleFileName(idx),
+			Mode: syscall.S_IFREG,
+		})
+	}
 	stateMutex.RUnlock()
 
-	if !found { return nil, syscall.ENOENT }
-
-	entries := []fuse.DirEntry{
-		{Name: "credential-bundle.pem", Mode: syscall.S_IFREG},
-	}
-	if svid.HasHint {
-		entries = append(entries, fuse.DirEntry{Name: "hint", Mode: syscall.S_IFREG})
-	}
-
-	domains, err := id.getBundleTargetDomains(caller.Pid)
+	domains, err := bundleTargetDomains(pid)
 	if err == 0 {
-		bundleMutex.RLock()
-		seen := make(map[string]bool)
 		for _, td := range domains {
-			if _, exists := globalBundles[td]; exists && !seen[td] {
-				seen[td] = true
-				entries = append(entries, fuse.DirEntry{
-					Name: fmt.Sprintf("%s.spiffe-trust-bundle.pem", td),
-					Mode: syscall.S_IFREG,
-				})
-			}
+			entries = append(entries, fuse.DirEntry{
+				Name: trustBundleFileName(td),
+				Mode: syscall.S_IFREG,
+			})
 		}
-		bundleMutex.RUnlock()
 	}
 
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
 	return fs.NewListDirStream(entries), 0
 }
 
 type snapshotHandle struct {
 	content []byte
 }
+
+// Every caller gets its own credentials from the same path, so the kernel must
+// never answer a read from a page cache shared between them. Nothing is cached
+// today anyway, because a fresh inode is minted on each lookup, but that is a
+// side effect rather than a promise: say it outright so the guarantee survives
+// any later change to how inodes are handed out.
+//
+// This replaced FOPEN_NONSEEKABLE, which was only ever working around a missing
+// size in the lookup reply. With the size reported, that flag bought nothing and
+// cost pread and sendfile-to-a-file, which had to fail and let callers fall back
+// rather than simply working.
+const openFlags = fuse.FOPEN_DIRECT_IO
 
 type TrustBundleFile struct {
 	fs.Inode
@@ -322,7 +356,7 @@ func (t *TrustBundleFile) Open(ctx context.Context, flags uint32) (fs.FileHandle
 
 	snapshot := make([]byte, len(content))
 	copy(snapshot, content)
-	return &snapshotHandle{content: snapshot}, fuse.FOPEN_NONSEEKABLE, 0
+	return &snapshotHandle{content: snapshot}, openFlags, 0
 }
 
 func (t *TrustBundleFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
@@ -352,12 +386,12 @@ var _ fs.NodeReader = (*BundleFile)(nil)
 var _ fs.NodeGetattrer = (*BundleFile)(nil)
 
 func (b *BundleFile) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
-	caller, ok := fuse.FromContext(ctx)
+	pid, ok := callerPid(ctx)
 	if !ok { return nil, 0, syscall.EACCES }
-	if _, alive := verifyOrCreatePidState(caller.Pid); !alive { return nil, 0, syscall.EACCES }
+	if _, alive := verifyOrCreatePidState(pid); !alive { return nil, 0, syscall.EACCES }
 
 	stateMutex.RLock()
-	state, exists := pidRegistry[caller.Pid]
+	state, exists := pidRegistry[pid]
 	if !exists {
 		stateMutex.RUnlock()
 		return nil, 0, syscall.EIO
@@ -368,7 +402,7 @@ func (b *BundleFile) Open(ctx context.Context, flags uint32) (fs.FileHandle, uin
 
 	snapshot := make([]byte, len(svid.CredentialBundle))
 	copy(snapshot, svid.CredentialBundle)
-	return &snapshotHandle{content: snapshot}, fuse.FOPEN_NONSEEKABLE, 0
+	return &snapshotHandle{content: snapshot}, openFlags, 0
 }
 
 func (b *BundleFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
@@ -383,10 +417,10 @@ func (b *BundleFile) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.At
 			return 0
 		}
 	}
-	caller, ok := fuse.FromContext(ctx)
+	pid, ok := callerPid(ctx)
 	if !ok { return syscall.EACCES }
 
-	state, alive := verifyOrCreatePidState(caller.Pid)
+	state, alive := verifyOrCreatePidState(pid)
 	if !alive { return syscall.EACCES }
 
 	stateMutex.RLock()
@@ -398,37 +432,41 @@ func (b *BundleFile) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.At
 	return 0
 }
 
-type HintFile struct { fs.Inode; indexName string }
-var _ fs.NodeOpener = (*HintFile)(nil)
-var _ fs.NodeReader = (*HintFile)(nil)
-var _ fs.NodeGetattrer = (*HintFile)(nil)
+type HintsFile struct { fs.Inode }
+var _ fs.NodeOpener = (*HintsFile)(nil)
+var _ fs.NodeReader = (*HintsFile)(nil)
+var _ fs.NodeGetattrer = (*HintsFile)(nil)
 
-func (h *HintFile) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
-	caller, ok := fuse.FromContext(ctx)
-	if !ok { return nil, 0, syscall.EACCES }
-	if _, alive := verifyOrCreatePidState(caller.Pid); !alive { return nil, 0, syscall.EACCES }
+// hintsContentForPid renders the hints document for the calling process. An
+// empty registry is not an error; it renders as an empty hints array.
+func hintsContentForPid(ctx context.Context) ([]byte, syscall.Errno) {
+	pid, ok := callerPid(ctx)
+	if !ok { return nil, syscall.EACCES }
+
+	state, alive := verifyOrCreatePidState(pid)
+	if !alive { return nil, syscall.EACCES }
 
 	stateMutex.RLock()
-	state, exists := pidRegistry[caller.Pid]
-	if !exists {
-		stateMutex.RUnlock()
-		return nil, 0, syscall.EIO
-	}
-	svid, found := state.SvidRegistry[h.indexName]
+	content, err := buildHintsJSON(state.SvidRegistry)
 	stateMutex.RUnlock()
-	if !found || !svid.HasHint { return nil, 0, syscall.EIO }
-
-	content := []byte(svid.Hint + "\n")
-	snapshot := make([]byte, len(content))
-	copy(snapshot, content)
-	return &snapshotHandle{content: snapshot}, fuse.FOPEN_NONSEEKABLE, 0
+	if err != nil {
+		log.Printf("[Hints] Failed rendering hints for PID %d: %v", pid, err)
+		return nil, syscall.EIO
+	}
+	return content, 0
 }
 
-func (h *HintFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+func (h *HintsFile) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	content, errno := hintsContentForPid(ctx)
+	if errno != 0 { return nil, 0, errno }
+	return &snapshotHandle{content: content}, openFlags, 0
+}
+
+func (h *HintsFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	return readHelper(fh.(*snapshotHandle).content, dest, off)
 }
 
-func (h *HintFile) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+func (h *HintsFile) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	if fh != nil {
 		if sh, ok := fh.(*snapshotHandle); ok {
 			out.Mode = syscall.S_IFREG | 0644
@@ -436,18 +474,10 @@ func (h *HintFile) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.Attr
 			return 0
 		}
 	}
-	caller, ok := fuse.FromContext(ctx)
-	if !ok { return syscall.EACCES }
-
-	state, alive := verifyOrCreatePidState(caller.Pid)
-	if !alive { return syscall.EACCES }
-
-	stateMutex.RLock()
-	svid, found := state.SvidRegistry[h.indexName]
-	stateMutex.RUnlock()
-	if !found || !svid.HasHint { return syscall.EIO }
+	content, errno := hintsContentForPid(ctx)
+	if errno != 0 { return errno }
 	out.Mode = syscall.S_IFREG | 0644
-	out.Size = uint64(len(svid.Hint) + 1)
+	out.Size = uint64(len(content))
 	return 0
 }
 
@@ -462,8 +492,48 @@ func readHelper(content []byte, dest []byte, off int64) (fuse.ReadResult, syscal
 	return fuse.ReadResultData(content[off:end]), 0
 }
 
+// isFuseMount reports whether path is the mount point of a fuse filesystem.
+// Anything else at that path is not ours to unmount: under a container runtime
+// it is the bind mount the filesystem is served through, and detaching that
+// severs the mount propagation the mount depends on.
+func isFuseMount(path string) bool {
+	f, err := os.Open("/proc/self/mounts")
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 3 {
+			continue
+		}
+		if fields[1] == path && strings.HasPrefix(fields[2], "fuse") {
+			return true
+		}
+	}
+	return false
+}
+
+// mountOptions is shared with the tests so they exercise the same settings the
+// binary runs with. Nothing is cached: the filesystem serves different content
+// to different callers, so a kernel cache shared across them could hand one
+// workload another's credentials.
+func mountOptions() *fs.Options {
+	zeroDuration := time.Duration(0)
+	return &fs.Options{
+		EntryTimeout: &zeroDuration,
+		AttrTimeout:  &zeroDuration,
+		MountOptions: fuse.MountOptions{
+			AllowOther:  true,
+			DirectMount: true,
+		},
+	}
+}
+
 func main() {
-	forceUnmount := flag.Bool("umount", false, "Forcefully unmount the target directory if it is already mounted or stuck")
+	forceUnmount := flag.Bool("umount", false, "Take ownership of the mount point: clear a stale fuse mount at startup, and unmount on SIGINT or SIGTERM. Without this a mount outliving the process is left disconnected, so reads fail loudly instead of falling through to whatever is underneath.")
 	flag.Parse()
 
 	args := flag.Args()
@@ -473,13 +543,17 @@ func main() {
 	mountPoint := args[0]
 
 	if *forceUnmount {
-		log.Printf("[FUSE-Engine] Attempting lazy unmount cleanup on: %s", mountPoint)
-		err := unix.Unmount(mountPoint, unix.MNT_DETACH)
-		if err != nil {
-			log.Printf("[FUSE-Engine] Cleanup unmount notice (can be ignored if not previously mounted): %v", err)
+		if !isFuseMount(mountPoint) {
+			log.Printf("[FUSE-Engine] Nothing to clean up at %s: it is not a fuse mount", mountPoint)
 		} else {
-			log.Printf("[FUSE-Engine] Successfully detached previous stale mount at %s", mountPoint)
-			time.Sleep(1 * time.Second)
+			log.Printf("[FUSE-Engine] Attempting lazy unmount cleanup on: %s", mountPoint)
+			err := unix.Unmount(mountPoint, unix.MNT_DETACH)
+			if err != nil {
+				log.Printf("[FUSE-Engine] Cleanup unmount notice: %v", err)
+			} else {
+				log.Printf("[FUSE-Engine] Successfully detached previous stale mount at %s", mountPoint)
+				time.Sleep(1 * time.Second)
+			}
 		}
 	}
 
@@ -499,22 +573,37 @@ func main() {
 	}
 
 	root := &MainRoot{}
-	zeroDuration := time.Duration(0)
 
-	opts := &fs.Options{
-		EntryTimeout: &zeroDuration,
-		AttrTimeout:  &zeroDuration,
-		MountOptions: fuse.MountOptions{
-			AllowOther: true,
-			DirectMount: true,
-		},
-	}
-
-	server, err := fs.Mount(mountPoint, root, opts)
+	server, err := fs.Mount(mountPoint, root, mountOptions())
 	if err != nil {
 		log.Fatalf("Mount initialization failed: %v", err)
 	}
 
 	log.Printf("SPIRE Transparent-Path FUSE Driver running at: %s", mountPoint)
+
+	// Only unmount on the way out when asked to. A mount that outlives the
+	// process is dead rather than merely idle, and every read of it fails with
+	// ENOTCONN. That is usually what you want: it is louder, and safer, than
+	// reverting the path to whatever sits under the mount point. Under a
+	// container runtime it is not, because the runtime cannot bind a dead mount
+	// and so the replacement instance never starts.
+	if *forceUnmount {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			sig := <-sigChan
+			log.Printf("[FUSE-Engine] Received %s, unmounting %s", sig, mountPoint)
+			if err := server.Unmount(); err != nil {
+				// Unmount refuses while the filesystem is in use, so detach it
+				// instead. Leaving it behind is worse than tearing it out from
+				// under a reader.
+				log.Printf("[FUSE-Engine] Unmount failed: %v. Detaching instead.", err)
+				if err := unix.Unmount(mountPoint, unix.MNT_DETACH); err != nil {
+					log.Printf("[FUSE-Engine] Detach also failed: %v", err)
+				}
+			}
+		}()
+	}
+
 	server.Wait()
 }

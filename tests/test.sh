@@ -80,8 +80,10 @@ wait_for_jwt() {
   return 1
 }
 
-# Get the package repo and install the packages
-sudo curl -s -o /etc/apt/sources.list.d/spire-examples.list https://raw.githubusercontent.com/spiffe/spire-examples/refs/heads/main/examples/debs/amd64/spire-examples.list
+# Get the package repo and install the packages. The package repo is published
+# per architecture, so take it from the machine rather than pinning one.
+DEB_ARCH="$(dpkg --print-architecture)"
+sudo curl -s -o /etc/apt/sources.list.d/spire-examples.list "https://raw.githubusercontent.com/spiffe/spire-examples/refs/heads/main/examples/debs/${DEB_ARCH}/spire-examples.list"
 sudo apt-get update
 sudo apt-get install -y spire-common spire-agent spire-server spire-controller-manager
 
@@ -115,14 +117,34 @@ sudo systemctl start spire-agent@main
 wait_for_healthcheck spire-agent /var/run/spire/agent/sockets/main/public/api.sock
 
 # Build the code
-go build -o spiffefs spire.go main.go
+go build -o spiffefs .
 
 # Start it up
 mkdir -p /tmp/mnt
 sudo ./spiffefs /tmp/mnt &
 
-#FIXME wait for spiffefs startup.... probably needs a health check to fix.
-sleep 15
+# Wait for what the tests actually need, rather than guessing at a duration. The
+# mount appears within a second or two, but the trust bundles arrive separately:
+# they come from a stream that backs off and retries, so credentials can be
+# served before any bundle is. A fixed sleep raced that and failed on the slower
+# runners.
+wait_for_spiffefs() {
+  local timeout=120
+  local count=0
+  while [ "${count}" -lt "${timeout}" ]; do
+    if mountpoint -q /tmp/mnt &&
+       [ -s /tmp/mnt/hints.json ] &&
+       [ -s /tmp/mnt/example.org.spiffe-trust-bundle.x509.pem ]; then
+      return 0
+    fi
+    sleep 2
+    count=$((count + 2))
+  done
+  echo "spiffefs did not serve a trust bundle within ${timeout}s"
+  ls -la /tmp/mnt/ || true
+  return 1
+}
+wait_for_spiffefs
 
 sudo cp tests/test*.sh /usr/libexec/
 sudo cp tests/systemd/test*.service /etc/systemd/system
