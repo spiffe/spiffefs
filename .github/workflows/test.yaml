@@ -13,7 +13,22 @@ jobs:
   # a reader picks varies by tool and version, so asserting through cat or
   # busybox tests those rather than us.
   read-paths:
-    runs-on: ubuntu-24.04
+    # Whether a read is answered depends on kernel behaviour that has already
+    # differed between versions, so run the widest spread of runners on offer:
+    # oldest to newest, on both architectures.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-22.04
+          - ubuntu-22.04-arm
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+          # Preview images. Drop these if they stop being offered.
+          - ubuntu-26.04
+          - ubuntu-26.04-arm
+
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - name: Checkout
@@ -25,6 +40,11 @@ jobs:
           go-version: '1.26'
           cache: false
 
+      - name: Show kernel and architecture
+        # Named in the log so a failure points at a kernel rather than a runner
+        # label, and so the spread actually covered is visible.
+        run: uname -srm
+
       - name: Unit tests
         run: 'go test ./...'
 
@@ -34,7 +54,22 @@ jobs:
         run: sudo env "PATH=$PATH" "GOFLAGS=$GOFLAGS" go test -v -run TestReadPaths ./...
 
   tests:
-    runs-on: ubuntu-24.04
+    # The same spread as the read paths job. This one is far heavier, since each
+    # run builds a cluster, but it is the only place the filesystem is exercised
+    # by real workloads, so kernel differences matter here too.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-22.04
+          - ubuntu-22.04-arm
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+          # Preview images. Drop these if they stop being offered.
+          - ubuntu-26.04
+          - ubuntu-26.04-arm
+
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - name: Checkout
@@ -48,6 +83,9 @@ jobs:
 
       - name: Install yq
         run: go install github.com/mikefarah/yq/v4@latest
+
+      - name: Show kernel and architecture
+        run: uname -srm
 
       - name: Install BusyBox and jq
         run: |

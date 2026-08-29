@@ -80,8 +80,10 @@ wait_for_jwt() {
   return 1
 }
 
-# Get the package repo and install the packages
-sudo curl -s -o /etc/apt/sources.list.d/spire-examples.list https://raw.githubusercontent.com/spiffe/spire-examples/refs/heads/main/examples/debs/amd64/spire-examples.list
+# Get the package repo and install the packages. The package repo is published
+# per architecture, so take it from the machine rather than pinning one.
+DEB_ARCH="$(dpkg --print-architecture)"
+sudo curl -s -o /etc/apt/sources.list.d/spire-examples.list "https://raw.githubusercontent.com/spiffe/spire-examples/refs/heads/main/examples/debs/${DEB_ARCH}/spire-examples.list"
 sudo apt-get update
 sudo apt-get install -y spire-common spire-agent spire-server spire-controller-manager
 

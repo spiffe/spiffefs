@@ -293,6 +293,18 @@ type snapshotHandle struct {
 	content []byte
 }
 
+// Every caller gets its own credentials from the same path, so the kernel must
+// never answer a read from a page cache shared between them. Nothing is cached
+// today anyway, because a fresh inode is minted on each lookup, but that is a
+// side effect rather than a promise: say it outright so the guarantee survives
+// any later change to how inodes are handed out.
+//
+// This replaced FOPEN_NONSEEKABLE, which was only ever working around a missing
+// size in the lookup reply. With the size reported, that flag bought nothing and
+// cost pread and sendfile-to-a-file, which had to fail and let callers fall back
+// rather than simply working.
+const openFlags = fuse.FOPEN_DIRECT_IO
+
 type TrustBundleFile struct {
 	fs.Inode
 	trustDomain string
@@ -309,7 +321,7 @@ func (t *TrustBundleFile) Open(ctx context.Context, flags uint32) (fs.FileHandle
 
 	snapshot := make([]byte, len(content))
 	copy(snapshot, content)
-	return &snapshotHandle{content: snapshot}, fuse.FOPEN_NONSEEKABLE, 0
+	return &snapshotHandle{content: snapshot}, openFlags, 0
 }
 
 func (t *TrustBundleFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
@@ -355,7 +367,7 @@ func (b *BundleFile) Open(ctx context.Context, flags uint32) (fs.FileHandle, uin
 
 	snapshot := make([]byte, len(svid.CredentialBundle))
 	copy(snapshot, svid.CredentialBundle)
-	return &snapshotHandle{content: snapshot}, fuse.FOPEN_NONSEEKABLE, 0
+	return &snapshotHandle{content: snapshot}, openFlags, 0
 }
 
 func (b *BundleFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
@@ -412,7 +424,7 @@ func hintsContentForPid(ctx context.Context) ([]byte, syscall.Errno) {
 func (h *HintsFile) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	content, errno := hintsContentForPid(ctx)
 	if errno != 0 { return nil, 0, errno }
-	return &snapshotHandle{content: content}, fuse.FOPEN_NONSEEKABLE, 0
+	return &snapshotHandle{content: content}, openFlags, 0
 }
 
 func (h *HintsFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {

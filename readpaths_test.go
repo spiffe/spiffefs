@@ -190,8 +190,8 @@ func seedReadPathState(t *testing.T) map[string][]byte {
 	}
 }
 
-func TestReadPathsDeliverWholeFile(t *testing.T) {
-	want := seedReadPathState(t)
+func mountForTest(t *testing.T) string {
+	t.Helper()
 
 	dir := t.TempDir()
 	server, err := fs.Mount(dir, &MainRoot{}, mountOptions())
@@ -203,6 +203,95 @@ func TestReadPathsDeliverWholeFile(t *testing.T) {
 			_ = unix.Unmount(dir, unix.MNT_DETACH)
 		}
 	})
+	return dir
+}
+
+// The filesystem hands different callers different credentials through the same
+// path, so the kernel must never satisfy a read from a cache. Change what is
+// served and the next read has to show it; if it does not, one workload could be
+// served another's key.
+func TestContentIsNeverServedFromCache(t *testing.T) {
+	seedReadPathState(t)
+	dir := mountForTest(t)
+	path := filepath.Join(dir, hintsFileName)
+
+	first, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+
+	pid := uint32(os.Getpid())
+	stateMutex.Lock()
+	pidRegistry[pid].SvidRegistry = map[string]*SVIDFileSystemState{
+		"0": {CredentialBundle: []byte("x"), Hint: "rotated", Fingerprint: "sha256:rotated", TrustDomain: "example.org"},
+		"1": {CredentialBundle: []byte("y"), Hint: "second", Fingerprint: "sha256:second", TrustDomain: "example.org"},
+	}
+	stateMutex.Unlock()
+
+	second, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("second read: %v", err)
+	}
+
+	if bytes.Equal(first, second) {
+		t.Fatalf("the same bytes came back after the content changed, so a cache served it:\n%s", first)
+	}
+	if !bytes.Contains(second, []byte("rotated")) {
+		t.Fatalf("second read did not reflect the new content:\n%s", second)
+	}
+
+	// The size has to track too, or a splicing reader truncates to the old one.
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if fi.Size() != int64(len(second)) {
+		t.Fatalf("stat reports %d bytes, read returned %d", fi.Size(), len(second))
+	}
+}
+
+// The strict version of the same property. Changing the length can invalidate a
+// cache on its own, so swap the bytes for different ones of exactly the same
+// length: nothing about the metadata changes, and only a genuinely uncached read
+// can tell the difference. Two workloads holding equal-length credentials is the
+// ordinary case, not a corner one.
+func TestSameLengthContentIsNeverServedFromCache(t *testing.T) {
+	seedReadPathState(t)
+	dir := mountForTest(t)
+	path := filepath.Join(dir, credentialBundleName)
+
+	first, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+
+	swapped := bytes.Repeat([]byte("Z"), len(first))
+	pid := uint32(os.Getpid())
+	stateMutex.Lock()
+	pidRegistry[pid].SvidRegistry["0"] = &SVIDFileSystemState{
+		CredentialBundle: swapped,
+		Hint:             "main",
+		Fingerprint:      bundleFingerprint(swapped),
+		TrustDomain:      "example.org",
+	}
+	stateMutex.Unlock()
+
+	second, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("second read: %v", err)
+	}
+
+	if len(second) != len(first) {
+		t.Fatalf("length changed unexpectedly: %d then %d", len(first), len(second))
+	}
+	if !bytes.Equal(second, swapped) {
+		t.Fatalf("a read after a same-length change returned stale bytes; the kernel cached them")
+	}
+}
+
+func TestReadPathsDeliverWholeFile(t *testing.T) {
+	want := seedReadPathState(t)
+	dir := mountForTest(t)
 
 	for name, content := range want {
 		t.Run(name, func(t *testing.T) {
