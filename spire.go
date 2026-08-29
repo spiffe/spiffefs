@@ -33,9 +33,39 @@ func cleanTrustDomain(td string) string {
 	return strings.Split(td, "/")[0]
 }
 
+// fetchSpireSVIDsForPID keeps a caller's identities up to date until the caller
+// exits. It retries rather than giving up on the first failure: a workload that
+// reads before its registration entry has propagated is answered with
+// "no identity issued", and without retrying that caller would be left with no
+// credentials for as long as it lives, even once the entry arrives. Its state is
+// created once and reused, so nothing else would go back for it.
 func fetchSpireSVIDsForPID(ctx context.Context, socketPath string, pid uint32, updateChan chan<- SVIDUpdatePayload) {
 	defer close(updateChan)
 
+	const retryDelay = 2 * time.Second
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		if !subscribeToSVIDs(ctx, socketPath, pid, updateChan) {
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(retryDelay):
+		}
+	}
+}
+
+// subscribeToSVIDs runs one attempt. It reports whether another is worth making;
+// only the caller going away ends the loop.
+func subscribeToSVIDs(ctx context.Context, socketPath string, pid uint32, updateChan chan<- SVIDUpdatePayload) bool {
 	conn, err := grpc.DialContext(ctx, fmt.Sprintf("unix://%s", socketPath),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
@@ -43,8 +73,8 @@ func fetchSpireSVIDsForPID(ctx context.Context, socketPath string, pid uint32, u
 		}),
 	)
 	if err != nil {
-		log.Printf("[SPIRE-Client] Failed connecting to SPIRE socket %s: %v", socketPath, err)
-		return
+		log.Printf("[SPIRE-Client] Failed connecting to SPIRE socket %s: %v. Retrying...", socketPath, err)
+		return true
 	}
 	defer conn.Close()
 
@@ -56,8 +86,8 @@ func fetchSpireSVIDsForPID(ctx context.Context, socketPath string, pid uint32, u
 
 	stream, err := client.SubscribeToX509SVIDs(ctx, req)
 	if err != nil {
-		log.Printf("[SPIRE-Client] Failed subscribing to SVID watch stream for PID %d: %v", pid, err)
-		return
+		log.Printf("[SPIRE-Client] Failed subscribing to SVID watch stream for PID %d: %v. Retrying...", pid, err)
+		return true
 	}
 
 	log.Printf("[SPIRE-Client] Active identity watch established for PID %d", pid)
@@ -65,8 +95,12 @@ func fetchSpireSVIDsForPID(ctx context.Context, socketPath string, pid uint32, u
 	for {
 		resp, err := stream.Recv()
 		if err != nil {
-			log.Printf("[SPIRE-Client] Identity stream closed/interrupted for PID %d: %v", pid, err)
-			return
+			if ctx.Err() != nil {
+				// The caller exited and its context was cancelled; stop.
+				return false
+			}
+			log.Printf("[SPIRE-Client] Identity stream closed/interrupted for PID %d: %v. Retrying...", pid, err)
+			return true
 		}
 
 		newMap := make(map[string]*SVIDFileSystemState)
@@ -113,7 +147,7 @@ func fetchSpireSVIDsForPID(ctx context.Context, socketPath string, pid uint32, u
 
 		select {
 		case <-ctx.Done():
-			return
+			return false
 		case updateChan <- payload:
 		}
 	}
