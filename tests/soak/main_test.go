@@ -19,6 +19,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 type testCA struct {
@@ -397,5 +399,57 @@ func TestVerifyStopsOnFatalAndWaitsOnRetryable(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed < time.Second {
 		t.Errorf("verify gave up on an incomplete view after only %s", elapsed)
+	}
+}
+
+// Half the point of this client is which thread it reads from, so the randomiser
+// has to actually produce both readers. A silent degradation to the group leader
+// would make every soak run look green while never testing the path where fuse
+// reports a thread id that is not the process id.
+func TestPickReaderProducesBothReaders(t *testing.T) {
+	const runs = 100
+
+	seen := map[string]int{}
+	for i := 0; i < runs; i++ {
+		_, kind, _ := pickReader()
+		seen[kind]++
+	}
+	t.Logf("readers over %d picks: %v", runs, seen)
+
+	if seen[readerLeader] == 0 {
+		t.Errorf("never picked the group leader in %d tries", runs)
+	}
+	if seen[readerWorker] == 0 {
+		t.Errorf("never got a worker thread in %d tries", runs)
+	}
+	// The first locked goroutine can land on the main thread, but it stays
+	// locked, so the retry is guaranteed a different one. Falling back at all
+	// means that reasoning is wrong.
+	if got := seen[readerWorkerUnavailable]; got != 0 {
+		t.Errorf("fell back to the group leader %d times; the retry should always find a free thread", got)
+	}
+}
+
+// The worker reader has to actually run the closure on its own thread, not just
+// report one.
+func TestWorkerReaderRunsOnItsOwnThread(t *testing.T) {
+	var run func(func() error) error
+	var kind string
+	for i := 0; i < 8 && kind != readerWorker; i++ {
+		run, kind, _ = pickReader()
+	}
+	if kind != readerWorker {
+		t.Skip("randomiser never chose a worker thread")
+	}
+
+	var tid int
+	if err := run(func() error {
+		tid = unix.Gettid()
+		return nil
+	}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if tid == os.Getpid() {
+		t.Errorf("worker reader ran on the group leader (tid %d == pid %d)", tid, os.Getpid())
 	}
 }

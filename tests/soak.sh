@@ -45,6 +45,11 @@ launched=0
 passed=0
 failed=0
 
+# Which thread each workload read from. Tallied so a green run can show the
+# worker-thread path was actually taken: a client that silently fell back to the
+# group leader every time would otherwise look identical to one that did not.
+declare -A READERS
+
 # Random, and valid both as a systemd unit name and as a SPIRE entry ID, so one
 # token names the unit and its entries and cleanup needs no bookkeeping.
 new_name() {
@@ -147,6 +152,10 @@ reap_one() {
   # alongside creation.
   delete_entries "${name}"
 
+  local reader
+  reader="$(sed -n 's/^soak-reader: //p' "${SOAK_LOG_DIR}/${name}.log" | head -n 1)"
+  READERS[${reader:-none}]=$(( ${READERS[${reader:-none}]:-0} + 1 ))
+
   if [ "${rc}" -eq 0 ]; then
     passed=$((passed + 1))
   else
@@ -202,6 +211,22 @@ done
 set -x
 
 echo "soak: launched=${launched} passed=${passed} failed=${failed}"
+
+for reader in "${!READERS[@]}"; do
+  echo "soak: ${READERS[${reader}]} workloads read from ${reader}"
+done
+
+# fuse reports the calling thread, not the calling process, so reads from a
+# non-leader thread are a distinct path through spiffefs. A run where none
+# happened has not tested it, however green it looks.
+if [ "${READERS[worker]:-0}" -eq 0 ]; then
+  echo "soak: no workload read from a worker thread; that path went untested"
+  exit 1
+fi
+if [ "${READERS[leader]:-0}" -eq 0 ]; then
+  echo "soak: no workload read from the group leader; that path went untested"
+  exit 1
+fi
 
 # Nothing should be left behind: every reaped worker deleted its own entries.
 remaining="$(sudo spire-server entry show -socketPath "${SPIRE_SERVER_SOCKET}" | grep -c "spiffe://${TRUST_DOMAIN}/soak/" || true)"

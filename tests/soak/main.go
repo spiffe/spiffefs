@@ -118,7 +118,12 @@ func main() {
 	fmt.Printf("soak %s: pausing %s before reading\n", *name, pause)
 	time.Sleep(pause)
 
-	run, where := pickReader()
+	run, kind, where := pickReader()
+	// Machine readable as well as human readable: the driver tallies these so a
+	// green run can show that both readers were actually used. Half the point of
+	// this client is the thread it reads from, and without a tally that is the
+	// one thing a passing run cannot demonstrate.
+	fmt.Printf("soak-reader: %s\n", kind)
 	fmt.Printf("soak %s: reading from %s\n", *name, where)
 
 	err = run(func() error {
@@ -135,17 +140,28 @@ func fail(name string, err error) {
 	os.Exit(1)
 }
 
+// Reader kinds, reported on stdout for the driver to tally.
+const (
+	readerLeader = "leader"
+	readerWorker = "worker"
+	// The randomiser asked for a worker thread and could not get one. Not a
+	// failure on its own -- thread scheduling is not ours to assert on -- but
+	// the driver needs to see it, because a run where this is the only outcome
+	// never exercised the worker path at all.
+	readerWorkerUnavailable = "worker-unavailable"
+)
+
 // pickReader chooses, at random, whether this run's reads happen on the process
 // group leader or on some other thread. The distinction matters: fuse reports
 // the calling *thread* id, and spiffefs has to map it back to the process
 // before it can look up who is asking.
-func pickReader() (func(func() error) error, string) {
+func pickReader() (func(func() error) error, string, string) {
 	if rand.Intn(2) == 0 {
 		return func(f func() error) error {
 			runtime.LockOSThread()
 			defer runtime.UnlockOSThread()
 			return f()
-		}, fmt.Sprintf("the group leader (tid %d)", unix.Gettid())
+		}, readerLeader, fmt.Sprintf("the group leader (tid %d)", unix.Gettid())
 	}
 
 	// The first locked goroutine can land on the main thread, since the main
@@ -154,12 +170,11 @@ func pickReader() (func(func() error) error, string) {
 	for attempt := 0; attempt < 4; attempt++ {
 		run, tid := lockedThreadRunner()
 		if tid != os.Getpid() {
-			return run, fmt.Sprintf("a worker thread (tid %d, pid %d)", tid, os.Getpid())
+			return run, readerWorker, fmt.Sprintf("a worker thread (tid %d, pid %d)", tid, os.Getpid())
 		}
 	}
 
-	// Thread scheduling is not ours to assert on. Say so and read anyway.
-	return func(f func() error) error { return f() }, "the group leader (no worker thread came free)"
+	return func(f func() error) error { return f() }, readerWorkerUnavailable, "the group leader (no worker thread came free)"
 }
 
 // lockedThreadRunner starts a goroutine pinned to one OS thread and returns a
