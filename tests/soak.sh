@@ -237,10 +237,21 @@ fi
 
 # spiffefs logs an eviction whenever the pidfd reaper reclaims a caller's state.
 # Fewer evictions than workloads means per-caller state is piling up, which is
-# the leak only a churn test is in a position to notice. Other callers -- the
-# driver's own shells -- evict too, so this is a floor rather than an equality.
-sleep 10
-evictions="$(grep -cE 'Evicting state|Inline eviction' "${SPIFFEFS_LOG}" || true)"
+# the leak only a churn test is in a position to notice.
+#
+# The expected margin here is zero, not comfortable: one reaper eviction per
+# workload, and the driver's own shell is still alive so it contributes none.
+# So this polls instead of taking one snapshot -- the reaper is prompt but not
+# instant, and a single straggler would otherwise read as a leak. A real leak
+# never converges and still fails.
+evictions=0
+for _ in $(seq 1 12); do
+  sleep 5
+  evictions="$(grep -cE 'Evicting state|Inline eviction' "${SPIFFEFS_LOG}" || true)"
+  if [ "${evictions}" -ge "${launched}" ]; then
+    break
+  fi
+done
 echo "soak: spiffefs evicted ${evictions} caller states for ${launched} workloads"
 if [ "${evictions}" -lt "${launched}" ]; then
   echo "soak: per-caller state is not being reclaimed"
