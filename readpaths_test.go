@@ -168,6 +168,7 @@ func seedReadPathState(t *testing.T) map[string][]byte {
 		PidFd:        pidFd,
 		CancelFunc:   func() {},
 		SvidRegistry: registry,
+		Bundles:      map[string][]byte{"example.org": trust},
 	}
 	stateMutex.Unlock()
 	t.Cleanup(func() {
@@ -175,10 +176,6 @@ func seedReadPathState(t *testing.T) map[string][]byte {
 		delete(pidRegistry, pid)
 		stateMutex.Unlock()
 	})
-
-	bundleMutex.Lock()
-	globalBundles = map[string][]byte{"example.org": trust}
-	bundleMutex.Unlock()
 
 	hints, err := buildHintsJSON(registry)
 	if err != nil {
