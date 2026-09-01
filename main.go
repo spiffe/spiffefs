@@ -21,20 +21,29 @@ import (
 )
 
 type PidState struct {
-	Pid                   uint32
-	PidFd                 int
-	CancelFunc            context.CancelFunc
-	SvidRegistry          map[string]*SVIDFileSystemState
-	FederatedTrustDomains []string
+	Pid          uint32
+	PidFd        int
+	CancelFunc   context.CancelFunc
+	SvidRegistry map[string]*SVIDFileSystemState
+	// The trust bundles this caller should trust, PEM encoded and keyed by
+	// trust domain. Scoped to the caller rather than to the process: what a
+	// workload is told to trust follows from its own registration entry.
+	Bundles map[string][]byte
 }
 
-var (
-	stateMutex    sync.RWMutex
-	pidRegistry   = make(map[uint32]*PidState)
-	spireSocket   = "/var/run/spire/agent/sockets/main/private/admin.sock"
+const (
+	defaultBrokerAddress   = "unix:///var/run/spire/agent/sockets/main/broker/broker.sock"
+	defaultWorkloadAddress = "unix:///var/run/spire/agent/sockets/main/public/api.sock"
+	defaultAdminSocket     = "/var/run/spire/agent/sockets/main/private/admin.sock"
+)
 
-	bundleMutex   sync.RWMutex
-	globalBundles = make(map[string][]byte)
+var (
+	stateMutex  sync.RWMutex
+	pidRegistry = make(map[uint32]*PidState)
+
+	// The upstream chosen at startup. Every caller's credentials come from
+	// here, and nothing past this point asks which API is behind it.
+	identities identitySource
 )
 
 func isPidFdAlive(fd int) bool {
@@ -110,11 +119,11 @@ func verifyOrCreatePidState(callerPid uint32) (*PidState, bool) {
 	readyChan := make(chan struct{})
 
 	state := &PidState{
-		Pid:                   callerPid,
-		PidFd:                 fd,
-		CancelFunc:            cancel,
-		SvidRegistry:          make(map[string]*SVIDFileSystemState),
-		FederatedTrustDomains: []string{},
+		Pid:          callerPid,
+		PidFd:        fd,
+		CancelFunc:   cancel,
+		SvidRegistry: make(map[string]*SVIDFileSystemState),
+		Bundles:      make(map[string][]byte),
 	}
 	pidRegistry[callerPid] = state
 
@@ -140,7 +149,7 @@ func verifyOrCreatePidState(callerPid uint32) (*PidState, bool) {
 		}
 	}(callerPid, fd, cancel)
 
-	go fetchSpireSVIDsForPID(ctx, spireSocket, callerPid, updateChan)
+	go identities.subscribe(ctx, callerPid, updateChan)
 
 	var once sync.Once
 	go func(p uint32, s *PidState) {
@@ -148,8 +157,8 @@ func verifyOrCreatePidState(callerPid uint32) (*PidState, bool) {
 			stateMutex.Lock()
 			if current, exists := pidRegistry[p]; exists && current == s {
 				s.SvidRegistry = payload.Registry
-				s.FederatedTrustDomains = payload.Federated
-				log.Printf("[Registry-Update] Refreshed %d SVIDs and %d federated domains for PID %d", len(payload.Registry), len(payload.Federated), p)
+				s.Bundles = payload.Bundles
+				log.Printf("[Registry-Update] Refreshed %d SVIDs and %d trust bundles for PID %d", len(payload.Registry), len(payload.Bundles), p)
 			}
 			stateMutex.Unlock()
 
@@ -182,9 +191,8 @@ var _ fs.NodeLookuper = (*MainRoot)(nil)
 var _ fs.NodeReaddirer = (*MainRoot)(nil)
 
 // bundleTargetDomains returns the trust domains this PID should be handed a
-// bundle for: its own SVIDs' domains plus everything it federates with, minus
-// any domain we have not actually received a bundle for. Deduped and sorted so
-// readdir output is stable.
+// bundle for. The upstream settled that question when it filled in the
+// caller's snapshot; sorted here so readdir output is stable.
 func bundleTargetDomains(pid uint32) ([]string, syscall.Errno) {
 	stateMutex.RLock()
 	state, exists := pidRegistry[pid]
@@ -193,30 +201,29 @@ func bundleTargetDomains(pid uint32) ([]string, syscall.Errno) {
 		return nil, syscall.ENOENT
 	}
 
-	seen := make(map[string]bool)
-	for _, svid := range state.SvidRegistry {
-		if svid.TrustDomain != "" {
-			seen[svid.TrustDomain] = true
-		}
-	}
-	for _, td := range state.FederatedTrustDomains {
-		if td != "" {
-			seen[td] = true
-		}
+	domains := make([]string, 0, len(state.Bundles))
+	for td := range state.Bundles {
+		domains = append(domains, td)
 	}
 	stateMutex.RUnlock()
 
-	var domains []string
-	bundleMutex.RLock()
-	for td := range seen {
-		if _, ok := globalBundles[td]; ok {
-			domains = append(domains, td)
-		}
-	}
-	bundleMutex.RUnlock()
-
 	sort.Strings(domains)
 	return domains, 0
+}
+
+// pidTrustBundle returns the bytes this PID reads for td's trust bundle. Every
+// caller is answered from its own snapshot, so two callers asking after the
+// same trust domain are not promised the same answer.
+func pidTrustBundle(pid uint32, td string) ([]byte, bool) {
+	stateMutex.RLock()
+	defer stateMutex.RUnlock()
+
+	state, exists := pidRegistry[pid]
+	if !exists {
+		return nil, false
+	}
+	bundle, ok := state.Bundles[td]
+	return bundle, ok
 }
 
 func (r *MainRoot) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
@@ -257,18 +264,9 @@ func (r *MainRoot) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 	}
 
 	if targetDomain, ok := parseTrustBundleFileName(name); ok {
-		domains, err := bundleTargetDomains(pid)
-		if err != 0 { return nil, err }
-
-		for _, td := range domains {
-			if td == targetDomain {
-				bundleMutex.RLock()
-				size := len(globalBundles[td])
-				bundleMutex.RUnlock()
-
-				setLookupAttr(out, size)
-				return r.NewPersistentInode(ctx, &TrustBundleFile{trustDomain: td}, fileAttr), 0
-			}
+		if bundle, found := pidTrustBundle(pid, targetDomain); found {
+			setLookupAttr(out, len(bundle))
+			return r.NewPersistentInode(ctx, &TrustBundleFile{trustDomain: targetDomain}, fileAttr), 0
 		}
 	}
 
@@ -349,9 +347,12 @@ var _ fs.NodeReader = (*TrustBundleFile)(nil)
 var _ fs.NodeGetattrer = (*TrustBundleFile)(nil)
 
 func (t *TrustBundleFile) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
-	bundleMutex.RLock()
-	content, exists := globalBundles[t.trustDomain]
-	bundleMutex.RUnlock()
+	pid, ok := callerPid(ctx)
+	if !ok { return nil, 0, syscall.EACCES }
+
+	if _, alive := verifyOrCreatePidState(pid); !alive { return nil, 0, syscall.EACCES }
+
+	content, exists := pidTrustBundle(pid, t.trustDomain)
 	if !exists { return nil, 0, syscall.EIO }
 
 	snapshot := make([]byte, len(content))
@@ -371,9 +372,12 @@ func (t *TrustBundleFile) Getattr(ctx context.Context, fh fs.FileHandle, out *fu
 			return 0
 		}
 	}
-	bundleMutex.RLock()
-	content, exists := globalBundles[t.trustDomain]
-	bundleMutex.RUnlock()
+	pid, ok := callerPid(ctx)
+	if !ok { return syscall.EACCES }
+
+	if _, alive := verifyOrCreatePidState(pid); !alive { return syscall.EACCES }
+
+	content, exists := pidTrustBundle(pid, t.trustDomain)
 	if !exists { return syscall.EIO }
 	out.Mode = syscall.S_IFREG | 0644
 	out.Size = uint64(len(content))
@@ -532,13 +536,61 @@ func mountOptions() *fs.Options {
 	}
 }
 
+// withUnixScheme accepts a bare filesystem path where a URI is wanted. The
+// delegated upstream took bare paths, so an operator who already has
+// SPIFFE_ENDPOINT_SOCKET set should not have to rewrite it to switch modes.
+func withUnixScheme(addr string) string {
+	if strings.Contains(addr, "://") {
+		return addr
+	}
+	return "unix://" + addr
+}
+
+// newIdentitySource builds the upstream named by mode, blocking until it can
+// serve callers. This is the only place in the program that names a mode.
+func newIdentitySource(mode, brokerAddress string) identitySource {
+	switch mode {
+	case "broker":
+		workloadAddr := defaultWorkloadAddress
+		if env := os.Getenv("SPIFFE_ENDPOINT_SOCKET"); env != "" {
+			workloadAddr = withUnixScheme(env)
+		}
+		brokerAddr := defaultBrokerAddress
+		if env := os.Getenv("SPIFFE_BROKER_ADDRESS"); env != "" {
+			brokerAddr = withUnixScheme(env)
+		}
+		if brokerAddress != "" {
+			brokerAddr = withUnixScheme(brokerAddress)
+		}
+		log.Printf("[FUSE-Engine] Broker mode: broker %s, workload API %s", brokerAddr, workloadAddr)
+		return newBrokerSource(workloadAddr, brokerAddr)
+
+	case "delegated":
+		if brokerAddress != "" {
+			log.Printf("[FUSE-Engine] Ignoring -broker-address: it has no meaning in delegated mode")
+		}
+		adminSocket := defaultAdminSocket
+		if env := os.Getenv("SPIFFE_ENDPOINT_SOCKET"); env != "" {
+			adminSocket = strings.TrimPrefix(env, "unix://")
+		}
+		log.Printf("[FUSE-Engine] Delegated mode (deprecated): admin socket %s", adminSocket)
+		return newDelegatedSource(adminSocket)
+
+	default:
+		log.Fatalf("Unknown -mode %q: want broker or delegated", mode)
+		return nil
+	}
+}
+
 func main() {
+	mode := flag.String("mode", "broker", "Upstream to get credentials from: \"broker\" for the SPIFFE Broker API, or \"delegated\" for the SPIRE Delegated Identity API. Delegated is deprecated and will be removed.")
+	brokerAddress := flag.String("broker-address", "", "Broker API endpoint, unix:// or tcp://. Overrides SPIFFE_BROKER_ADDRESS. Broker mode only.")
 	forceUnmount := flag.Bool("umount", false, "Take ownership of the mount point: clear a stale fuse mount at startup, and unmount on SIGINT or SIGTERM. Without this a mount outliving the process is left disconnected, so reads fail loudly instead of falling through to whatever is underneath.")
 	flag.Parse()
 
 	args := flag.Args()
 	if len(args) < 1 {
-		log.Fatal("Usage: spiffefs [-umount] <mountpoint>")
+		log.Fatal("Usage: spiffefs [-mode=broker|delegated] [-broker-address <addr>] [-umount] <mountpoint>")
 	}
 	mountPoint := args[0]
 
@@ -557,20 +609,10 @@ func main() {
 		}
 	}
 
-	if envSocket := os.Getenv("SPIFFE_ENDPOINT_SOCKET"); envSocket != "" {
-		spireSocket = envSocket
-	}
-	log.Printf("[FUSE-Engine] Transparent mapping active against socket: %s", spireSocket)
-
-	readyChan := make(chan struct{})
-	go watchGlobalX509Bundles(context.Background(), spireSocket, readyChan)
-
-	select {
-	case <-readyChan:
-		log.Printf("[FUSE-Engine] Initial trust bundles primed successfully")
-	case <-time.After(3 * time.Second):
-		log.Printf("[FUSE-Engine] Timeout waiting for trust bundles; mounting anyway")
-	}
+	// Blocks until the upstream can answer. Mounting first would serve
+	// EACCES to every early reader, and a workload that reads once at
+	// startup has no reason to come back.
+	identities = newIdentitySource(*mode, *brokerAddress)
 
 	root := &MainRoot{}
 
